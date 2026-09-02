@@ -1,0 +1,7 @@
+/target
+/result
+/result-*
+.env
+.env.*
+*.pem
+*.key
