@@ -37,6 +37,13 @@
             __darwinAllowLocalNetworking = true;
             meta.mainProgram = manifest.package.name;
           };
+
+          pi = pkgs.writeShellApplication {
+            name = "exact-mcp-pi";
+            text = ''
+              exec "${self.packages.${system}.default}/bin/exact-mcp" pi -- "$@"
+            '';
+          };
         }
       );
 

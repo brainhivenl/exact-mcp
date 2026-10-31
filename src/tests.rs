@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use reqwest::Client;
 use reqwest::Url;
-use reqwest::blocking::Client;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, StreamOwned};
 use serde_json::{Value, json};
@@ -26,14 +26,14 @@ fn tempdir() -> std::io::Result<TempDir> {
     Ok(directory)
 }
 
-fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+async fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let directory = tempdir().unwrap();
     let generated = rcgen::generate_simple_self_signed(vec!["exact-mcp.localhost".into()]).unwrap();
     let cert_path = directory.path().join("cert.pem");
     let key_path = directory.path().join("key.pem");
     std::fs::write(&cert_path, generated.cert.pem()).unwrap();
     std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
-    let server = oauth::load_tls_config(&cert_path, &key_path).unwrap();
+    let server = oauth::load_tls_config(&cert_path, &key_path).await.unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(generated.cert.der().clone()).unwrap();
     let client =
@@ -108,6 +108,7 @@ impl Server {
                         Err(error) => panic!("Mock listener failed: {error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -321,18 +322,19 @@ fn callback_checks_state_path_errors_and_duplicate_parameters() {
     }
 }
 
-#[test]
-fn local_callback_ignores_noise_and_returns_only_a_valid_code() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_callback_ignores_noise_and_returns_only_a_valid_code() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     let address = listener.local_addr().unwrap();
     let redirect = Url::parse(&format!(
         "https://exact-mcp.localhost:{}/callback",
         address.port()
     ))
     .unwrap();
-    let (server_config, client_config) = tls_configs();
-    let handle = thread::spawn(move || {
+    let (server_config, client_config) = tls_configs().await;
+    let handle = tokio::spawn(async move {
         oauth::wait_for_code(
             &listener,
             &server_config,
@@ -340,6 +342,7 @@ fn local_callback_ignores_noise_and_returns_only_a_valid_code() {
             "expected",
             Duration::from_secs(3),
         )
+        .await
     });
     let mut plaintext = TcpStream::connect(address).unwrap();
     plaintext
@@ -370,21 +373,22 @@ fn local_callback_ignores_noise_and_returns_only_a_valid_code() {
         );
         assert!(!response.contains("code=good"));
     }
-    assert_eq!(handle.join().unwrap().unwrap(), "good");
+    assert_eq!(handle.await.unwrap().unwrap(), "good");
 }
 
-#[test]
-fn local_callback_waits_for_complete_headers() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_callback_waits_for_complete_headers() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     let address = listener.local_addr().unwrap();
     let redirect = Url::parse(&format!(
         "https://exact-mcp.localhost:{}/callback",
         address.port()
     ))
     .unwrap();
-    let (server_config, client_config) = tls_configs();
-    let handle = thread::spawn(move || {
+    let (server_config, client_config) = tls_configs().await;
+    let handle = tokio::spawn(async move {
         oauth::wait_for_code(
             &listener,
             &server_config,
@@ -392,6 +396,7 @@ fn local_callback_waits_for_complete_headers() {
             "expected",
             Duration::from_secs(3),
         )
+        .await
     });
     let mut stream = tls_stream(address, Arc::clone(&client_config));
     stream
@@ -416,16 +421,17 @@ fn local_callback_waits_for_complete_headers() {
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert_eq!(handle.join().unwrap().unwrap(), "good");
+    assert_eq!(handle.await.unwrap().unwrap(), "good");
 }
 
-#[test]
-fn self_signed_callback_works_with_an_explicit_local_certificate_exception() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_signed_callback_works_with_an_explicit_local_certificate_exception() {
     let redirect =
         oauth::validate_redirect_uri("https://exact-mcp.localhost:8400/callback").unwrap();
     let tls_config = oauth::self_signed_tls_config(&redirect).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     let address = listener.local_addr().unwrap();
     let redirect = Url::parse(&format!(
         "https://exact-mcp.localhost:{}/callback",
@@ -433,7 +439,7 @@ fn self_signed_callback_works_with_an_explicit_local_certificate_exception() {
     ))
     .unwrap();
     let callback = redirect.join("?state=expected&code=test-code").unwrap();
-    let handle = thread::spawn(move || {
+    let handle = tokio::spawn(async move {
         oauth::wait_for_code(
             &listener,
             &tls_config,
@@ -441,6 +447,7 @@ fn self_signed_callback_works_with_an_explicit_local_certificate_exception() {
             "expected",
             Duration::from_secs(5),
         )
+        .await
     });
     let strict = Client::builder()
         .no_proxy()
@@ -448,7 +455,7 @@ fn self_signed_callback_works_with_an_explicit_local_certificate_exception() {
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
-    assert!(strict.get(callback.clone()).send().is_err());
+    assert!(strict.get(callback.clone()).send().await.is_err());
     let local_exception = Client::builder()
         .no_proxy()
         .resolve("exact-mcp.localhost", address)
@@ -456,40 +463,44 @@ fn self_signed_callback_works_with_an_explicit_local_certificate_exception() {
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
-    let response = local_exception.get(callback).send().unwrap();
+    let response = local_exception.get(callback).send().await.unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(handle.join().unwrap().unwrap(), "test-code");
+    assert_eq!(handle.await.unwrap().unwrap(), "test-code");
 }
 
-#[test]
-fn tls_config_rejects_missing_malformed_and_mismatched_keys() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_config_rejects_missing_malformed_and_mismatched_keys() {
     let directory = tempdir().unwrap();
     let cert_path = directory.path().join("cert.pem");
     let key_path = directory.path().join("key.pem");
-    assert!(oauth::load_tls_config(&cert_path, &key_path).is_err());
+    assert!(oauth::load_tls_config(&cert_path, &key_path).await.is_err());
     std::fs::write(&cert_path, "not a certificate").unwrap();
     std::fs::write(&key_path, "private-key-content").unwrap();
-    let error = oauth::load_tls_config(&cert_path, &key_path).err().unwrap();
+    let error = oauth::load_tls_config(&cert_path, &key_path)
+        .await
+        .err()
+        .unwrap();
     assert!(!format!("{error:#}").contains("private-key-content"));
     let first = rcgen::generate_simple_self_signed(vec!["exact-mcp.localhost".into()]).unwrap();
     let second = rcgen::generate_simple_self_signed(vec!["exact-mcp.localhost".into()]).unwrap();
     std::fs::write(&cert_path, first.cert.pem()).unwrap();
     std::fs::write(&key_path, second.signing_key.serialize_pem()).unwrap();
-    assert!(oauth::load_tls_config(&cert_path, &key_path).is_err());
+    assert!(oauth::load_tls_config(&cert_path, &key_path).await.is_err());
 }
 
-#[test]
-fn tls_callback_handles_authorization_denial() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_callback_handles_authorization_denial() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     let address = listener.local_addr().unwrap();
     let redirect = Url::parse(&format!(
         "https://exact-mcp.localhost:{}/callback",
         address.port()
     ))
     .unwrap();
-    let (server_config, client_config) = tls_configs();
-    let handle = thread::spawn(move || {
+    let (server_config, client_config) = tls_configs().await;
+    let handle = tokio::spawn(async move {
         oauth::wait_for_code(
             &listener,
             &server_config,
@@ -497,6 +508,7 @@ fn tls_callback_handles_authorization_denial() {
             "expected",
             Duration::from_secs(3),
         )
+        .await
     });
     let mut stream = tls_stream(address, client_config);
     stream.write_all(b"GET /callback?state=expected&error=access_denied HTTP/1.1\r\nHost: exact-mcp.localhost\r\n\r\n").unwrap();
@@ -506,7 +518,7 @@ fn tls_callback_handles_authorization_denial() {
     assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
     assert!(
         handle
-            .join()
+            .await
             .unwrap()
             .unwrap_err()
             .to_string()
@@ -514,12 +526,13 @@ fn tls_callback_handles_authorization_denial() {
     );
 }
 
-#[test]
-fn callback_times_out_without_requests() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callback_times_out_without_requests() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     let redirect = Url::parse("https://exact-mcp.localhost:8400/callback").unwrap();
-    let (server_config, _) = tls_configs();
+    let (server_config, _) = tls_configs().await;
     let error = oauth::wait_for_code(
         &listener,
         &server_config,
@@ -527,12 +540,13 @@ fn callback_times_out_without_requests() {
         "state",
         Duration::from_millis(25),
     )
+    .await
     .unwrap_err();
     assert!(error.to_string().contains("Timed out"));
 }
 
-#[test]
-fn code_exchange_sends_form_and_accepts_numeric_or_string_expiry() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_exchange_sends_form_and_accepts_numeric_or_string_expiry() {
     for expires in [json!(600), json!("600")] {
         let server = Server::new(vec![tokens_response(expires)]);
         let started = oauth::now().unwrap();
@@ -544,6 +558,7 @@ fn code_exchange_sends_form_and_accepts_numeric_or_string_expiry() {
             "https://exact-mcp.localhost:8400/callback",
             "code+value",
         )
+        .await
         .unwrap();
         assert_eq!(tokens.access_token, "new-access");
         assert_eq!(tokens.refresh_token, "new-refresh");
@@ -570,8 +585,8 @@ fn code_exchange_sends_form_and_accepts_numeric_or_string_expiry() {
     }
 }
 
-#[test]
-fn malformed_token_responses_and_server_errors_do_not_leak_secrets() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_token_responses_and_server_errors_do_not_leak_secrets() {
     let responses = [
         Response {
             status: "400 Bad Request",
@@ -594,7 +609,8 @@ fn malformed_token_responses_and_server_errors_do_not_leak_secrets() {
             "client-secret",
             "redirect",
             "code",
-        );
+        )
+        .await;
         let error = format!("{:#}", error.err().expect("Expected token failure"));
         for secret in ["client-secret", "access-token", "refresh-token"] {
             assert!(!error.contains(secret), "{error}");
@@ -603,16 +619,16 @@ fn malformed_token_responses_and_server_errors_do_not_leak_secrets() {
     }
 }
 
-#[test]
-fn storage_round_trips_and_atomically_replaces_tokens_and_selection() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_round_trips_and_atomically_replaces_tokens_and_selection() {
     let directory = tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    assert!(store.load().unwrap().is_none());
+    let store = Store::open(directory.path()).await.unwrap();
+    assert!(store.load().await.unwrap().is_none());
     let mut session = session(&Url::parse("https://start.exactonline.nl").unwrap(), false);
-    store.save(&session).unwrap();
+    store.save(&session).await.unwrap();
     session.tokens.access_token = "replacement".into();
-    store.save(&session).unwrap();
-    let stored = store.require_session().unwrap();
+    store.save(&session).await.unwrap();
+    let stored = store.require_session().await.unwrap();
     assert_eq!(stored.tokens.access_token, "replacement");
     assert_eq!(stored.administration.unwrap().code, 42);
     let raw = std::fs::read_to_string(directory.path().join("session.json")).unwrap();
@@ -631,31 +647,31 @@ fn storage_round_trips_and_atomically_replaces_tokens_and_selection() {
 }
 
 #[cfg(unix)]
-#[test]
-fn storage_rejects_public_permissions_and_symbolic_links() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_rejects_public_permissions_and_symbolic_links() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let root = tempdir().unwrap();
     let path = root.path().join("private");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path).await.unwrap();
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o700
     );
     let session = session(&Url::parse("https://start.exactonline.nl").unwrap(), false);
-    store.save(&session).unwrap();
+    store.save(&session).await.unwrap();
     let file = path.join("session.json");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(store.load().is_err());
+    assert!(store.load().await.is_err());
     std::fs::remove_file(&file).unwrap();
     symlink(root.path().join("elsewhere"), &file).unwrap();
-    assert!(store.load().is_err());
+    assert!(store.load().await.is_err());
     drop(store);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(Store::open(&path).is_err());
+    assert!(Store::open(&path).await.is_err());
 }
 
-#[test]
-fn listing_handles_pagination_without_selecting_the_current_division() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listing_handles_pagination_without_selecting_the_current_division() {
     let server = Server::new(vec![
         me_response(),
         Response::json(json!({"d": {
@@ -667,16 +683,20 @@ fn listing_handles_pagination_without_selecting_the_current_division() {
         ),
     ]);
     let directory = tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
     let mut session = session(&server.base, false);
     session.administration = None;
-    store.save(&session).unwrap();
-    let available = exact::administrations(&client(), &store, &mut session, None).unwrap();
+    store.save(&session).await.unwrap();
+    drop(store);
+    let client = exact::ExactClient::new(directory.path().into(), client(), None)
+        .await
+        .unwrap();
+    let available = client.administrations().await.unwrap();
     assert_eq!(
         available.iter().map(|item| item.code).collect::<Vec<_>>(),
         [7, 42]
     );
-    assert!(store.require_session().unwrap().administration.is_none());
+    assert!(client.session().await.unwrap().administration.is_none());
     let requests = server.finish();
     assert!(
         requests[0]
@@ -696,52 +716,53 @@ fn listing_handles_pagination_without_selecting_the_current_division() {
     );
 }
 
-#[test]
-fn selection_requires_an_accessible_code_and_preserves_previous_selection_on_failure() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_requires_an_accessible_code_and_preserves_previous_selection_on_failure() {
     let directory = tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut session = session(&Url::parse("https://start.exactonline.nl").unwrap(), false);
-    store.save(&session).unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let session = session(&Url::parse("https://start.exactonline.nl").unwrap(), false);
+    store.save(&session).await.unwrap();
+    drop(store);
+    let client = exact::ExactClient::new(directory.path().into(), client(), None)
+        .await
+        .unwrap();
     let available = vec![Administration {
         code: 7,
         description: "First company".into(),
     }];
-    assert!(exact::select_administration(&store, &mut session, &available, 999).is_err());
+    assert!(client.select_administration(&available, 999).await.is_err());
     assert_eq!(
-        store
-            .require_session()
-            .unwrap()
-            .administration
-            .unwrap()
-            .code,
+        client.session().await.unwrap().administration.unwrap().code,
         42
     );
-    let selected = exact::select_administration(&store, &mut session, &available, 7).unwrap();
+    let selected = client.select_administration(&available, 7).await.unwrap();
     assert_eq!(selected.code, 7);
     assert_eq!(
-        store
-            .require_session()
-            .unwrap()
-            .administration
-            .unwrap()
-            .code,
+        client.session().await.unwrap().administration.unwrap().code,
         7
     );
 }
 
-#[test]
-fn refresh_rotates_and_persists_tokens_before_api_calls() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_rotates_and_persists_tokens_before_api_calls() {
     let server = Server::new(vec![
         tokens_response(json!(600)),
         me_response(),
         divisions_response(),
     ]);
     let directory = tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut session = session(&server.base, true);
-    store.save(&session).unwrap();
-    exact::administrations(&client(), &store, &mut session, Some("client-secret")).unwrap();
-    let stored = store.require_session().unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    store.save(&session(&server.base, true)).await.unwrap();
+    drop(store);
+    let client = exact::ExactClient::new(
+        directory.path().into(),
+        client(),
+        Some("client-secret".into()),
+    )
+    .await
+    .unwrap();
+    client.administrations().await.unwrap();
+    let stored = client.session().await.unwrap();
     assert_eq!(stored.tokens.access_token, "new-access");
     assert_eq!(stored.tokens.refresh_token, "new-refresh");
     assert_eq!(stored.administration.unwrap().code, 42);
@@ -756,103 +777,108 @@ fn refresh_rotates_and_persists_tokens_before_api_calls() {
     );
 }
 
-#[test]
-fn concurrent_commands_reload_after_locking_and_refresh_only_once() {
-    let server = Server::new(vec![
-        tokens_response(json!(600)),
-        me_response(),
-        divisions_response(),
-        me_response(),
-        divisions_response(),
-    ]);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_commands_reload_after_locking_and_refresh_only_once() {
+    let server = Server::new(vec![tokens_response(json!(600))]);
     let directory = tempdir().unwrap();
-    {
-        let store = Store::open(directory.path()).unwrap();
-        store.save(&session(&server.base, true)).unwrap();
-    }
-    let barrier = Arc::new(Barrier::new(3));
-    let mut handles = Vec::new();
-    for _ in 0..2 {
-        let path = directory.path().to_owned();
-        let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            barrier.wait();
-            let store = Store::open(&path).unwrap();
-            let mut session = store.require_session().unwrap();
-            exact::administrations(&client(), &store, &mut session, Some("client-secret")).unwrap();
-        }));
-    }
-    barrier.wait();
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    let store = Store::open(directory.path()).await.unwrap();
+    store.save(&session(&server.base, true)).await.unwrap();
+    drop(store);
+    let first = exact::ExactClient::new(
+        directory.path().into(),
+        client(),
+        Some("client-secret".into()),
+    )
+    .await
+    .unwrap();
+    let second = exact::ExactClient::new(
+        directory.path().into(),
+        client(),
+        Some("client-secret".into()),
+    )
+    .await
+    .unwrap();
+    let (first, second) = tokio::join!(first.access_token(), second.access_token());
+    assert_eq!(first.unwrap(), "new-access");
+    assert_eq!(second.unwrap(), "new-access");
     let requests = server.finish();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.target.starts_with("POST"))
-            .count(),
-        1
-    );
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].target.starts_with("POST"));
 }
 
-#[test]
-fn expired_token_without_secret_fails_without_contacting_exact() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_token_without_secret_fails_without_contacting_exact() {
     let directory = tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut session = session(&Url::parse("http://127.0.0.1:1").unwrap(), true);
-    store.save(&session).unwrap();
-    let error = exact::administrations(&client(), &store, &mut session, None).unwrap_err();
+    let store = Store::open(directory.path()).await.unwrap();
+    store
+        .save(&session(&Url::parse("http://127.0.0.1:1").unwrap(), true))
+        .await
+        .unwrap();
+    drop(store);
+    let client = exact::ExactClient::new(directory.path().into(), client(), None)
+        .await
+        .unwrap();
+    let error = client.administrations().await.unwrap_err();
     assert!(error.to_string().contains("EXACT_CLIENT_SECRET"));
     assert_eq!(
-        store.require_session().unwrap().tokens.refresh_token,
+        client.session().await.unwrap().tokens.refresh_token,
         "old-refresh"
     );
 }
 
-#[test]
-fn rejected_refresh_does_not_overwrite_the_saved_session_or_retry() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_refresh_does_not_overwrite_the_saved_session_or_retry() {
     let server = Server::new(vec![Response {
         status: "400 Bad Request",
         body: "old-refresh client-secret invalid_grant".into(),
         location: None,
     }]);
     let directory = tempdir().unwrap();
-    let store = Store::open(directory.path()).unwrap();
-    let mut session = session(&server.base, true);
-    store.save(&session).unwrap();
-    let error =
-        exact::administrations(&client(), &store, &mut session, Some("client-secret")).unwrap_err();
+    let store = Store::open(directory.path()).await.unwrap();
+    store.save(&session(&server.base, true)).await.unwrap();
+    drop(store);
+    let client = exact::ExactClient::new(
+        directory.path().into(),
+        client(),
+        Some("client-secret".into()),
+    )
+    .await
+    .unwrap();
+    let error = client.administrations().await.unwrap_err();
     assert!(!format!("{error:#}").contains("old-refresh"));
     assert_eq!(
-        store.require_session().unwrap().tokens.refresh_token,
+        client.session().await.unwrap().tokens.refresh_token,
         "old-refresh"
     );
     assert_eq!(server.finish().len(), 1);
 }
 
-#[test]
-fn pagination_rejects_other_origins_non_api_paths_and_cycles() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pagination_rejects_other_origins_non_api_paths_and_cycles() {
     for next in [
         "http://127.0.0.1:1/api/v1/stolen",
+        "/api/v1/999/system/Divisions",
         "/outside-api",
         "/api/v1/current/Me?$select=CurrentDivision",
     ] {
-        let server = Server::new(vec![Response::json(json!({"d": {
-            "results": [{"CurrentDivision": 7}], "__next": next
-        }}))]);
+        let server = Server::new(vec![Response::json(
+            json!({"d": {"results": [{"CurrentDivision": 7}], "__next": next}}),
+        )]);
         let directory = tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut session = session(&server.base, false);
-        let error = exact::administrations(&client(), &store, &mut session, None).unwrap_err();
+        let store = Store::open(directory.path()).await.unwrap();
+        store.save(&session(&server.base, false)).await.unwrap();
+        drop(store);
+        let client = exact::ExactClient::new(directory.path().into(), client(), None)
+            .await
+            .unwrap();
+        let error = client.administrations().await.unwrap_err();
         assert!(error.to_string().contains("pagination"), "{error}");
         assert_eq!(server.finish().len(), 1);
     }
 }
 
-#[test]
-fn api_errors_and_redirects_are_not_retried_or_followed() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_errors_and_redirects_are_not_retried_or_followed() {
     for status in [
         "401 Unauthorized",
         "403 Forbidden",
@@ -865,12 +891,587 @@ fn api_errors_and_redirects_are_not_retried_or_followed() {
             location: Some("http://127.0.0.1:1/api/v1/stolen".into()),
         }]);
         let directory = tempdir().unwrap();
-        let store = Store::open(directory.path()).unwrap();
-        let mut session = session(&server.base, false);
-        let error =
-            exact::administrations(&client(), &store, &mut session, Some("secret")).unwrap_err();
+        let store = Store::open(directory.path()).await.unwrap();
+        store.save(&session(&server.base, false)).await.unwrap();
+        drop(store);
+        let client =
+            exact::ExactClient::new(directory.path().into(), client(), Some("secret".into()))
+                .await
+                .unwrap();
+        let error = client.administrations().await.unwrap_err();
         assert!(!format!("{error:#}").contains("old-access"));
         assert!(!format!("{error:#}").contains("financial-data"));
         assert_eq!(server.finish().len(), 1);
     }
+}
+
+const COMPANY_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+fn company() -> Value {
+    json!({
+        "ID": COMPANY_ID, "Code": "1001", "Name": "Company X",
+        "IsSupplier": true, "IsSales": true
+    })
+}
+
+fn company_response() -> Response {
+    Response::json(json!({"d": {"results": [company()]}}))
+}
+
+fn open_item(hid: i64, currency: &str, amount: Value) -> Value {
+    json!({
+        "HID": hid, "AccountId": COMPANY_ID, "Amount": amount,
+        "AmountInTransit": 0, "CurrencyCode": currency,
+        "DueDate": "/Date(946684800000)/", "InvoiceDate": "2000-01-01T00:00:00",
+        "InvoiceNumber": 2026001, "EntryNumber": 42, "JournalCode": "70",
+        "YourRef": "SUPPLIER-001", "Description": "Invoice"
+    })
+}
+
+async fn financial_backend(base: &Url) -> (TempDir, crate::financial::Backend) {
+    let directory = tempdir().unwrap();
+    {
+        let store = Store::open(directory.path()).await.unwrap();
+        store.save(&session(base, false)).await.unwrap();
+    }
+    let backend = crate::financial::Backend::new(directory.path().to_owned())
+        .await
+        .unwrap();
+    (directory, backend)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn company_search_escapes_odata_and_reports_ambiguous_truncated_matches() {
+    let server = Server::new(vec![Response::json(
+        json!({"d": {"results": [company(), company(), company()]}}),
+    )]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = backend
+        .search_accounts(crate::financial::SearchAccounts {
+            query: "  O'Neill & Sons  ".into(),
+            limit: Some(2),
+        })
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(result["has_more"], true);
+    assert_eq!(result["administration"]["Code"], 42);
+    assert_eq!(result["accounts"][0]["id"], COMPANY_ID);
+    assert_eq!(result["accounts"][0]["sales_allowed"], true);
+    let requests = server.finish();
+    let target = requests[0].target.split_whitespace().nth(1).unwrap();
+    let url = server_url(target);
+    let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(url.path(), "/api/v1/42/crm/Accounts");
+    assert_eq!(parameters["$filter"], "substringof('O''Neill & Sons',Name)");
+    assert_eq!(parameters["$top"], "3");
+    assert!(requests[0].target.starts_with("GET "));
+}
+
+fn server_url(target: &str) -> Url {
+    Url::parse("http://localhost")
+        .unwrap()
+        .join(target)
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_items_sum_decimal_amounts_and_keep_currencies_and_transit_separate() {
+    let mut first = open_item(1, "EUR", json!(0.1));
+    first["AmountInTransit"] = json!(0.05);
+    let mut second = open_item(2, "EUR", json!(0.2));
+    second["DueDate"] = json!(chrono::Local::now().date_naive().to_string());
+    second["AmountInTransit"] = Value::Null;
+    let mut credit = open_item(3, "EUR", json!(-0.1));
+    credit["HID"] = json!("3");
+    credit["DueDate"] = Value::Null;
+    let server = Server::new(vec![
+        company_response(),
+        Response::json(json!({"d": {"results": [first, second], "__next": "?page=2"}})),
+        Response::json(json!({"d": {"results": [credit, open_item(4, "USD", json!(10))]}})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = backend
+        .get_open_items(crate::financial::GetOpenItems {
+            account_id: COMPANY_ID.into(),
+            side: crate::financial::Side::Payable,
+        })
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 4);
+    let euros = &result["totals_by_currency"]["EUR"];
+    assert_eq!(euros["net_open_amount"], "0.2");
+    assert_eq!(euros["positive_open_amount"], "0.3");
+    assert_eq!(euros["negative_open_amount"], "-0.1");
+    assert_eq!(euros["overdue_net_amount"], "0.1");
+    assert_eq!(euros["known_in_transit_amount"], "0.05");
+    assert_eq!(euros["items_with_unknown_in_transit"], 1);
+    assert_eq!(euros["items_without_due_date"], 1);
+    assert_eq!(result["totals_by_currency"]["USD"]["net_open_amount"], "10");
+    assert_eq!(result["items"][0]["your_ref"], "SUPPLIER-001");
+    assert_eq!(result["items"][1]["overdue"], false);
+    assert_eq!(result["items"][2]["overdue"], Value::Null);
+    assert_eq!(result["side"], "payable");
+    assert!(result["retrieved_at"].as_str().is_some());
+    let requests = server.finish();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.target.starts_with("GET "))
+    );
+    let target = requests[1].target.split_whitespace().nth(1).unwrap();
+    let url = server_url(target);
+    assert_eq!(
+        url.path(),
+        "/api/v1/42/read/financial/PayablesListByAccount"
+    );
+    let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(parameters["accountId"], format!("guid'{COMPANY_ID}'"));
+    assert!(requests[2].target.contains("?page=2"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receivables_use_their_own_endpoint_and_return_a_complete_empty_report() {
+    let server = Server::new(vec![
+        company_response(),
+        Response::json(json!({"d": {"results": []}})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = backend
+        .get_open_items(crate::financial::GetOpenItems {
+            account_id: COMPANY_ID.into(),
+            side: crate::financial::Side::Receivable,
+        })
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["side"], "receivable");
+    assert_eq!(result["items"], json!([]));
+    assert_eq!(result["totals_by_currency"], json!({}));
+    assert_eq!(result["account"]["id"], COMPANY_ID);
+    let requests = server.finish();
+    assert!(
+        requests[1]
+            .target
+            .contains("/42/read/financial/ReceivablesListByAccount?")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn financial_queries_reject_invalid_inputs_before_network_access() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for (query, limit) in [
+        ("".to_string(), None),
+        (" ".to_string(), None),
+        ("x".repeat(101), None),
+        ("x".into(), Some(0)),
+        ("x".into(), Some(51)),
+    ] {
+        let error = backend
+            .search_accounts(crate::financial::SearchAccounts { query, limit })
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.to_string().contains("request failed"));
+    }
+    let error = backend
+        .get_open_items(crate::financial::GetOpenItems {
+            account_id: "company name' or true".into(),
+            side: crate::financial::Side::Payable,
+        })
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("UUID"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn financial_server_requires_selection_and_rejects_scope_changes() {
+    let directory = tempdir().unwrap();
+    let mut session = session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+    {
+        let store = Store::open(directory.path()).await.unwrap();
+        session.administration = None;
+        store.save(&session).await.unwrap();
+    }
+    assert!(
+        crate::financial::Backend::new(directory.path().to_owned())
+            .await
+            .is_err()
+    );
+    {
+        let store = Store::open(directory.path()).await.unwrap();
+        session.administration = Some(Administration {
+            code: 42,
+            description: "Selected company".into(),
+        });
+        store.save(&session).await.unwrap();
+    }
+    let backend = crate::financial::Backend::new(directory.path().to_owned())
+        .await
+        .unwrap();
+    for change in ["division", "client", "origin", "login"] {
+        let store = Store::open(directory.path()).await.unwrap();
+        let mut changed = self::session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+        match change {
+            "division" => changed.administration.as_mut().unwrap().code = 99,
+            "client" => changed.client_id = "another-client".into(),
+            "origin" => changed.base_url = "http://127.0.0.1:2/".into(),
+            "login" => changed.administration = None,
+            _ => unreachable!(),
+        }
+        store.save(&changed).await.unwrap();
+        drop(store);
+        let error = backend
+            .search_accounts(crate::financial::SearchAccounts {
+                query: "X".into(),
+                limit: None,
+            })
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("restart"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_items_reject_wrong_accounts_duplicates_and_missing_currencies() {
+    let mut wrong_account = open_item(1, "EUR", json!(10));
+    wrong_account["AccountId"] = json!("22222222-2222-2222-2222-222222222222");
+    for records in [
+        vec![wrong_account],
+        vec![open_item(1, "EUR", json!(1)), open_item(1, "EUR", json!(1))],
+        vec![open_item(1, "", json!(1))],
+    ] {
+        let server = Server::new(vec![
+            company_response(),
+            Response::json(json!({"d": {"results": records}})),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .get_open_items(crate::financial::GetOpenItems {
+                    account_id: COMPANY_ID.into(),
+                    side: crate::financial::Side::Payable
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(server.finish().len(), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_account_is_not_reported_as_having_zero_debt() {
+    let server = Server::new(vec![Response::json(json!({"d": {"results": []}}))]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let error = backend
+        .get_open_items(crate::financial::GetOpenItems {
+            account_id: COMPANY_ID.into(),
+            side: crate::financial::Side::Payable,
+        })
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("Account not found"));
+    assert_eq!(server.finish().len(), 1);
+}
+
+async fn read_async_request(stream: &mut tokio::net::TcpStream) -> Request {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut target = String::new();
+    reader.read_line(&mut target).await.unwrap();
+    let mut headers = HashMap::new();
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).await.unwrap() > 0);
+        if line == "\r\n" {
+            break;
+        }
+        let (name, value) = line.split_once(':').unwrap();
+        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+    }
+    let length = headers
+        .get("content-length")
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(0);
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).await.unwrap();
+    Request {
+        target,
+        headers,
+        body: String::from_utf8(body).unwrap(),
+    }
+}
+
+async fn write_async_response(stream: &mut tokio::net::TcpStream, body: &str) {
+    use tokio::io::AsyncWriteExt;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+async fn async_exact_client(base: &Url, expired: bool) -> (TempDir, exact::ExactClient) {
+    let directory = tempdir().unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    store.save(&session(base, expired)).await.unwrap();
+    drop(store);
+    let client = exact::ExactClient::new(
+        directory.path().into(),
+        client(),
+        Some("client-secret".into()),
+    )
+    .await
+    .unwrap();
+    (directory, client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_reads_overlap_and_do_not_hold_the_session_lock() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let (directory, client) = async_exact_client(&base, false).await;
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let first_request = read_async_request(&mut first).await;
+        started.send(()).unwrap();
+        let (mut second, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_request = read_async_request(&mut second).await;
+        let body = "{\"d\":{\"results\":[]}}";
+        write_async_response(&mut first, body).await;
+        write_async_response(&mut second, body).await;
+        [first_request, second_request]
+    });
+    let url = base.join("/api/v1/42/crm/Accounts").unwrap();
+    let request_client = client.clone();
+    let first_url = url.clone();
+    let first =
+        tokio::spawn(async move { request_client.get_collection::<Value>(first_url).await });
+    entered.await.unwrap();
+    let store = tokio::time::timeout(Duration::from_millis(500), Store::open(directory.path()))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(store);
+    let second = client.get_collection::<Value>(url).await.unwrap();
+    assert!(second.is_empty());
+    assert!(first.await.unwrap().unwrap().is_empty());
+    assert!(
+        server
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.target.starts_with("GET"))
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_an_api_read_drops_the_pending_http_request() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let (_directory, client) = async_exact_client(&base, false).await;
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_async_request(&mut socket).await;
+        started.send(()).unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, Ok(0))
+                || read
+                    .err()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+        );
+    });
+    let request_client = client.clone();
+    let request = tokio::spawn(async move {
+        request_client
+            .get_collection::<Value>(base.join("/api/v1/42/crm/Accounts").unwrap())
+            .await
+    });
+    entered.await.unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    server.await.unwrap();
+    client.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_query_still_persists_rotated_tokens_and_shutdown_drains_refresh() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let (directory, client) = async_exact_client(&base, true).await;
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let (release, continue_refresh) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_async_request(&mut socket).await;
+        assert!(request.target.starts_with("POST /api/oauth2/token"));
+        started.send(()).unwrap();
+        continue_refresh.await.unwrap();
+        write_async_response(&mut socket, &tokens_response(json!(600)).body).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        request
+    });
+    let request_client = client.clone();
+    let request = tokio::spawn(async move {
+        request_client
+            .get_collection::<Value>(base.join("/api/v1/42/crm/Accounts").unwrap())
+            .await
+    });
+    entered.await.unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    let shutdown_client = client.clone();
+    let mut shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let saved = store.require_session().await.unwrap();
+    assert_eq!(saved.tokens.access_token, "new-access");
+    assert_eq!(saved.tokens.refresh_token, "new-refresh");
+    assert_eq!(saved.administration.unwrap().code, 42);
+    assert!(
+        server
+            .await
+            .unwrap()
+            .body
+            .contains("refresh_token=old-refresh")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn lock_contention_yields_to_the_runtime_and_cancelled_waiters_do_not_hold_locks() {
+    let directory = tempdir().unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let path = directory.path().to_owned();
+    let waiter = tokio::spawn(async move { Store::open(&path).await });
+    let mut waiter = waiter;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+            .await
+            .is_err()
+    );
+    waiter.abort();
+    assert!(waiter.await.err().unwrap().is_cancelled());
+    drop(store);
+    let store = tokio::time::timeout(Duration::from_secs(1), Store::open(directory.path()))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(store);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn administration_selection_preserves_tokens_rotated_since_client_startup() {
+    let directory = tempdir().unwrap();
+    let base = Url::parse("http://127.0.0.1:1").unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    store.save(&session(&base, false)).await.unwrap();
+    drop(store);
+    let client = exact::ExactClient::new(directory.path().into(), client(), None)
+        .await
+        .unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let mut updated = store.require_session().await.unwrap();
+    updated.tokens.refresh_token = "already-rotated".into();
+    store.save(&updated).await.unwrap();
+    drop(store);
+    client
+        .select_administration(
+            &[Administration {
+                code: 7,
+                description: "Other administration".into(),
+            }],
+            7,
+        )
+        .await
+        .unwrap();
+    let stored = client.session().await.unwrap();
+    assert_eq!(stored.tokens.refresh_token, "already-rotated");
+    assert_eq!(stored.administration.unwrap().code, 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_prevents_a_new_refresh_from_starting() {
+    let (_directory, client) =
+        async_exact_client(&Url::parse("http://127.0.0.1:1").unwrap(), true).await;
+    client.shutdown().await;
+    let error = client.access_token().await.unwrap_err();
+    assert!(error.to_string().contains("shutting down"));
+    assert_eq!(
+        client.session().await.unwrap().tokens.refresh_token,
+        "old-refresh"
+    );
+    tokio::time::timeout(Duration::from_secs(1), client.shutdown())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_search_accepts_exacts_unwrapped_collection_response() {
+    for rows in [vec![company()], vec![]] {
+        let expected_count = rows.len();
+        let server = Server::new(vec![Response::json(json!({"d": rows}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let result = backend
+            .search_accounts(crate::financial::SearchAccounts {
+                query: "Company".into(),
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["accounts"].as_array().unwrap().len(), expected_count);
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unwrapped_final_page_is_combined_with_wrapped_paginated_rows() {
+    let server = Server::new(vec![
+        company_response(),
+        Response::json(
+            json!({"d": {"results": [open_item(1, "EUR", json!(1))], "__next": "?page=2"}}),
+        ),
+        Response::json(json!({"d": [open_item(2, "EUR", json!(2))]})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = backend
+        .get_open_items(crate::financial::GetOpenItems {
+            account_id: COMPANY_ID.into(),
+            side: crate::financial::Side::Payable,
+        })
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 2);
+    assert_eq!(result["totals_by_currency"]["EUR"]["net_open_amount"], "3");
+    assert_eq!(server.finish().len(), 3);
 }

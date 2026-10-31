@@ -1,16 +1,19 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
+use reqwest::Client;
 use reqwest::Url;
-use reqwest::blocking::Client;
+use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::time::{Instant, timeout_at};
+use tokio_rustls::TlsAcceptor;
 
 use crate::store::Tokens;
 
@@ -60,12 +63,17 @@ pub fn validate_redirect_uri(value: &str) -> Result<Url> {
     Ok(url)
 }
 
-pub fn load_tls_config(cert_file: &Path, key_file: &Path) -> Result<Arc<ServerConfig>> {
-    let certificates = CertificateDer::pem_file_iter(cert_file)
-        .context("Cannot open TLS certificate file")?
+pub async fn load_tls_config(cert_file: &Path, key_file: &Path) -> Result<Arc<ServerConfig>> {
+    let certificate_pem = tokio::fs::read(cert_file)
+        .await
+        .context("Cannot open TLS certificate file")?;
+    let certificates = CertificateDer::pem_slice_iter(&certificate_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("Cannot parse TLS certificate PEM")?;
-    let key = PrivateKeyDer::from_pem_file(key_file).context("Cannot read TLS private key PEM")?;
+    let key_pem = tokio::fs::read(key_file)
+        .await
+        .context("Cannot open TLS private key file")?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem).context("Cannot read TLS private key PEM")?;
     tls_config(certificates, key)
 }
 
@@ -113,16 +121,16 @@ pub fn authorization_url(
     Ok(url)
 }
 
-pub fn listen(redirect: &Url) -> Result<TcpListener> {
+pub async fn listen(redirect: &Url) -> Result<TcpListener> {
     let port = redirect.port().context("Missing callback port")?;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| {
-        format!("Cannot listen on localhost:{port}; choose a free registered redirect URI")
-    })?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .with_context(|| {
+            format!("Cannot listen on localhost:{port}; choose a free registered redirect URI")
+        })
 }
 
-pub fn wait_for_code(
+pub async fn wait_for_code(
     listener: &TcpListener,
     tls_config: &Arc<ServerConfig>,
     redirect: &Url,
@@ -130,27 +138,22 @@ pub fn wait_for_code(
     timeout: Duration,
 ) -> Result<String> {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let (stream, _) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25));
-                continue;
-            }
-            Err(error) => return Err(error).context("Cannot accept OAuth callback"),
+    let acceptor = TlsAcceptor::from(Arc::clone(tls_config));
+    while let Ok(connection) = timeout_at(deadline, listener.accept()).await {
+        let (stream, _) = connection.context("Cannot accept OAuth callback")?;
+        let connection_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+        let received = timeout_at(connection_deadline, async {
+            let mut stream = acceptor.accept(stream).await?;
+            let callback = read_request_target(&mut stream)
+                .await
+                .map(|target| parse_callback(&target, redirect, state))
+                .unwrap_or(Callback::Invalid);
+            Ok::<_, std::io::Error>((stream, callback))
+        })
+        .await;
+        let Ok(Ok((mut stream, callback))) = received else {
+            continue;
         };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(remaining.min(Duration::from_secs(2))))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let connection = ServerConnection::new(Arc::clone(tls_config))?;
-        let mut stream = StreamOwned::new(connection, stream);
-        let callback = read_request_target(&mut stream)
-            .map(|target| parse_callback(&target, redirect, state))
-            .unwrap_or(Callback::Invalid);
         let (status, body) = match &callback {
             Callback::Code(_) => (
                 "200 OK",
@@ -163,9 +166,15 @@ pub fn wait_for_code(
             Callback::Unrelated => ("404 Not Found", "Not found"),
             Callback::Invalid => ("400 Bad Request", "Invalid OAuth callback"),
         };
-        let _ = reply(&mut stream, status, body);
-        stream.conn.send_close_notify();
-        let _ = stream.flush();
+        let _ = timeout_at(
+            deadline.min(Instant::now() + Duration::from_secs(2)),
+            async {
+                reply(&mut stream, status, body).await?;
+                stream.shutdown().await?;
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await;
         match callback {
             Callback::Code(code) => return Ok(code),
             Callback::Denied => bail!("Exact authorization was denied; no session was changed"),
@@ -175,10 +184,10 @@ pub fn wait_for_code(
     bail!("Timed out waiting for Exact authorization; run `exact-mcp auth login` again")
 }
 
-fn read_request_target(stream: impl Read) -> Result<String> {
+async fn read_request_target(stream: impl AsyncRead + Unpin) -> Result<String> {
     let mut reader = BufReader::new(stream.take(8192));
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    reader.read_line(&mut line).await?;
     let parts: Vec<_> = line.split_whitespace().collect();
     ensure!(
         parts.len() == 3 && parts[0] == "GET" && matches!(parts[2], "HTTP/1.0" | "HTTP/1.1"),
@@ -188,7 +197,7 @@ fn read_request_target(stream: impl Read) -> Result<String> {
     loop {
         line.clear();
         ensure!(
-            reader.read_line(&mut line)? > 0,
+            reader.read_line(&mut line).await? > 0,
             "Incomplete or oversized callback request"
         );
         if line == "\r\n" {
@@ -237,17 +246,17 @@ pub(crate) fn parse_callback(target: &str, redirect: &Url, state: &str) -> Callb
     }
 }
 
-fn reply(stream: &mut impl Write, status: &str, body: &str) -> Result<()> {
-    write!(
-        stream,
+async fn reply(stream: &mut (impl AsyncWrite + Unpin), status: &str, body: &str) -> Result<()> {
+    let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    )?;
-    stream.flush()?;
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-pub fn exchange_code(
+pub async fn exchange_code(
     client: &Client,
     base: &Url,
     client_id: &str,
@@ -266,9 +275,10 @@ pub fn exchange_code(
             ("code", code),
         ],
     )
+    .await
 }
 
-pub fn refresh_tokens(
+pub async fn refresh_tokens(
     client: &Client,
     base: &Url,
     client_id: &str,
@@ -285,14 +295,15 @@ pub fn refresh_tokens(
             ("refresh_token", refresh_token),
         ],
     )
+    .await
 }
 
-fn request_tokens(client: &Client, base: &Url, form: &[(&str, &str)]) -> Result<Tokens> {
+async fn request_tokens(client: &Client, base: &Url, form: &[(&str, &str)]) -> Result<Tokens> {
     let started_at = now()?;
     let response = client
         .post(base.join("/api/oauth2/token")?)
         .form(form)
-        .send()
+        .send().await
         .context("Token request failed; not retried because Exact may have consumed the code/refresh token")?;
     let status = response.status();
     if !status.is_success() {
@@ -302,6 +313,7 @@ fn request_tokens(client: &Client, base: &Url, form: &[(&str, &str)]) -> Result<
     }
     let response: TokenResponse = response
         .json()
+        .await
         .map_err(|_| anyhow::anyhow!("Invalid token response; a new login may be required"))?;
     ensure!(
         response.token_type.eq_ignore_ascii_case("bearer")

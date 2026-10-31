@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online integration, starting with OAuth and explicit administration selection. This first milestone is a CLI, not an MCP server yet. It does not read or change financial records.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company search and outstanding payables/receivables. Financial operations are read-only; no invoice creation or payment tools are exposed.
 
 ## Setup
 
@@ -13,7 +13,7 @@ Use Nix with flakes enabled, or Rust 1.89 or newer.
    https://exact-mcp.localhost:8400/callback
    ```
 
-3. Make sure the authorizing user/app has access to the administrations you need. The `system/Divisions` endpoint requires the **Organization administration** scope.
+3. Make sure the authorizing user/app has access to the administrations you need. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries.
 4. With Nix, run the CLI directly (the first invocation builds it):
 
    ```sh
@@ -31,7 +31,7 @@ export EXACT_CLIENT_SECRET
 printf '\n'
 ```
 
-The CLI reads environment variables directly; it does not automatically load `.env` files. The client secret is never saved by the CLI. Keep it available in the environment for automatic token refresh on subsequent API commands.
+The CLI also loads `.env` from the current working directory before starting Tokio. Already-exported environment variables take precedence. `.env` is ignored by version control and excluded from the Nix build source; keep it private. The CLI never saves the client secret itself. Both normal commands and the Pi launcher use these credentials for automatic token refresh.
 
 ## Login and select an administration
 
@@ -58,6 +58,66 @@ Replace `123456` with a code from the list. Selection is checked against accessi
 `auth status` only inspects local storage; it does not contact Exact or prove the refresh token is still accepted. `administrations list --json` returns machine-readable administration records.
 
 Without Nix, use `cargo run -- <command>` or `./target/debug/exact-mcp <command>` instead.
+
+## Use as an MCP server
+
+After logging in and selecting an administration, build once so MCP initialization does not have to wait for compilation:
+
+```sh
+nix build
+nix run . -- serve
+```
+
+`serve` uses stdin/stdout exclusively for MCP protocol messages. Startup errors go to stderr. It requires a stored login and selected administration but does not contact Exact until a tool is called.
+
+### Launch Pi directly
+
+With Pi installed on `PATH`, run this from the repository directory:
+
+```sh
+nix run .#pi
+```
+
+This builds the MCP binary, loads credentials from the environment or the repository's `.env`, registers its exact Nix store path as the project-local `exact` server with direct tool exposure, and starts a fresh interactive Pi session. The secret is inherited through the process environment, not saved in the MCP configuration or requested again at a prompt. Existing Pi credentials, models and user-level configuration are reused unchanged.
+
+The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with two tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
+
+### Other MCP clients
+
+For MCP clients using a `mcpServers` configuration:
+
+```json
+{
+  "mcpServers": {
+    "exact": {
+      "command": "nix",
+      "args": ["run", "/absolute/path/to/exact-mcp", "--", "serve"]
+    }
+  }
+}
+```
+
+Ensure the MCP host can find `nix` and inherits `EXACT_CLIENT_SECRET` for automatic token refresh. Desktop clients may not inherit your interactive shell environment; configure their runtime environment securely. Do not put credentials in tracked files. You can alternatively launch `result/bin/exact-mcp serve` directly after `nix build`.
+
+### Financial tools
+
+- `search_accounts`: `{ "query": "Company X", "limit": 10 }`. Searches names within the selected administration; returns UUIDs, account codes, names, supplier flags and whether sales are allowed. Limit is 1–50; `has_more` signals truncated matches. Ambiguous names must be clarified, never silently resolved to the first result.
+- `get_open_items`: `{ "account_id": "<UUID from search_accounts>", "side": "payable" }`. Use `receivable` for amounts owed by the company. Returns all pages of current open items with invoice/entry references, due dates, descriptions and per-currency totals.
+
+The server is bound to the stored account configuration and administration at startup. If either changes, subsequent tools fail with a restart instruction rather than silently reading another administration.
+
+The CLI and MCP share one multithreaded Tokio runtime and async reqwest clients. MCP requests reuse one connection pool, and independent API reads can overlap. HTTPS callbacks use async tokio-rustls with ring. Session locks cover short state snapshots/updates and token exchanges, never ordinary API reads. Lock contention yields asynchronously; only bounded filesystem operations (including atomic save/fsync) use Tokio's blocking pool.
+
+### Financial interpretation
+
+- Monetary values are decimal strings, not floating-point totals. Exact's signs are preserved; positive and negative open amounts are also shown separately. Negative rows are not automatically classified as credit notes versus unmatched payments.
+- `net_open_amount` is the signed sum of report rows. `known_in_transit_amount` is a separate sum of reported transit amounts; it is **not subtracted** from the open balance and is not proof of bank settlement. Missing transit amounts remain unknown and are counted explicitly.
+- Payables and receivables are queried separately, and currencies are never offset or converted.
+- Overdue means the due date precedes the local machine's `as_of_date`; items due today are not overdue. Missing due dates remain unknown. The response includes the date, local UTC offset, retrieval timestamp and selected administration.
+- This is a current report, not a historical or transactionally frozen snapshot. Source data can change during pagination. Duplicate rows, unexpected companies, missing currencies and decimal overflows fail the query rather than returning misleading partial totals.
+- Tool results include company-supplied text. Names, descriptions and references are data, not instructions.
+
+Company search has been checked against a live administration without logging account values. Financial amount/sign behavior still needs verification against the live outstanding-items report.
 
 ### Nix build and development
 
@@ -94,9 +154,9 @@ The global `--data-dir <path>` option overrides the data directory, including fo
 
 - `auth status` prints the data-directory location. Defaults are `~/Library/Application Support/exact-mcp` on macOS and `~/.local/share/exact-mcp` on Linux, subject to OS/XDG configuration.
 - Tokens are **plaintext**, protected on Unix by a `0700` directory and `0600` session file. They are not encrypted or stored in Keychain. Other platforms use the current user's filesystem defaults; equivalent ACL protection has not been implemented or tested.
-- A file lock serializes commands using the same directory. Each command reloads the session after acquiring the lock, preventing simultaneous refreshes from using the same rotating refresh token.
-- Tokens are refreshed on demand with a ten-second expiry margin. Every successful refresh is atomically persisted before an API request proceeds. There is no background refresh daemon.
-- Token exchanges are not retried automatically: an uncertain response may mean Exact already consumed the code or refresh token. A crash or disk failure after token rotation can still require another login.
+- A file lock serializes session access and token exchanges across processes using the same directory. A refresh reloads the session after acquiring the lock, so another process's newly rotated tokens are reused rather than refreshed again. Ordinary API reads release the lock before network I/O.
+- Tokens are refreshed on demand with a ten-second expiry margin. Every successful refresh is atomically persisted before an API request proceeds. Refreshes run as tracked async tasks: cancelling a tool cancels ordinary reads but does not interrupt an already-started token refresh/save. MCP shutdown drains these tasks before exiting. There is no background refresh daemon.
+- Token exchanges are not retried automatically: an uncertain response may mean Exact already consumed the code or refresh token. A hard process kill, crash or disk failure after token rotation can still require another login; graceful shutdown cannot protect against those cases.
 - API pagination is followed only within the saved origin's `/api/v1/` path. HTTP redirects are disabled, and server response bodies/tokens are not included in errors.
 - API authorization and rate-limit failures stop the command; no automatic retry loop is used. If refresh fails, verify the client secret and authorize again if needed.
 
@@ -108,10 +168,13 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, pagination, safe errors and administration selection. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
+Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, scoped pagination, financial totals, safe errors and administration selection. Subprocess tests exercise MCP initialization, tool discovery, parallel tool calls, company search, open-item queries, structured results, tool errors, scope changes, cancellation during token rotation and clean shutdown on stdin EOF. Additional tests verify overlapping API reads, released query locks, cancelled HTTP requests, single-refresh concurrency and asynchronous lock contention. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
 
 ## References
 
 - [Exact: current user](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=SystemSystemMe)
 - [Exact: accessible administrations](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=SystemSystemDivisions)
+- [Exact: accounts](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=CRMAccounts)
+- [Exact: payables by account](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ReadFinancialPayablesListByAccount)
+- [Exact: receivables by account](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ReadFinancialReceivablesListByAccount)
 - [Picqer Exact client: authorization and refresh behavior](https://github.com/picqer/exact-php-client#authentication)

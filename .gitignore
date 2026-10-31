@@ -1,6 +1,7 @@
 /target
 /result
 /result-*
+/.pi/mcp.json
 .env
 .env.*
 *.pem
