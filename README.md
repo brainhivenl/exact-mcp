@@ -101,8 +101,19 @@ Ensure the MCP host can find `nix` and inherits `EXACT_CLIENT_SECRET` for automa
 
 ### Financial tools
 
-- `search_accounts`: `{ "query": "Company X", "limit": 10 }`. Searches names within the selected administration; returns UUIDs, account codes, names, supplier flags and whether sales are allowed. Limit is 1–50; `has_more` signals truncated matches. Ambiguous names must be clarified, never silently resolved to the first result.
-- `get_open_items`: `{ "account_id": "<UUID from search_accounts>", "side": "payable" }`. Use `receivable` for amounts owed by the company. Returns all pages of current open items with invoice/entry references, due dates, descriptions and per-currency totals.
+- `search_accounts`: `{ "query": "Company X", "limit": 10 }`. Searches name fragments within the selected administration; returns UUIDs, account codes, names, supplier flags and whether sales are allowed. Set `match_by` to `code` for an exact account-code lookup or `id` for a UUID lookup; the default is `name`. Limit is 1–50. When `has_more` is true, repeat the same query, field and limit with `offset` set to `next_offset`. Ambiguous matches must be clarified, never silently resolved to the first result. Results use a stable name/code/UUID ordering, but searches are not frozen snapshots: changes between calls can move matches. Offsets are applied while following Exact's pagination links, so later searches reread earlier pages rather than relying on server-side offset support.
+- `get_open_items`: `{ "account_id": "<UUID from search_accounts>", "side": "payable" }`. Use `receivable` for amounts owed by the company. Returns all pages of current open items with invoice/entry references, due dates, descriptions and per-currency totals. Optional `due_date_from` and `due_date_to` are inclusive `YYYY-MM-DD` due-date bounds; `overdue_only: true` selects items due before the local `as_of_date`. These filters intersect, and any active due-date/overdue filter excludes items without a due date. Set `summary_only: true` to omit the `items` field while retaining complete matching totals.
+
+Open-item results echo `filters`, `summary_only`, `source_item_count` (before filtering), and `matched_item_count` (after filtering). **All totals cover only matching items**, never the excluded balance. Filters and summary mode do not reduce source API reads: all pages are fetched and checked before totals are returned. For example, a compact overdue receivables query is:
+
+```json
+{
+  "account_id": "<UUID from search_accounts>",
+  "side": "receivable",
+  "overdue_only": true,
+  "summary_only": true
+}
+```
 
 The server is bound to the stored account configuration and administration at startup. If either changes, subsequent tools fail with a restart instruction rather than silently reading another administration.
 
@@ -168,7 +179,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, scoped pagination, financial totals, safe errors and administration selection. Subprocess tests exercise MCP initialization, tool discovery, parallel tool calls, company search, open-item queries, structured results, tool errors, scope changes, cancellation during token rotation and clean shutdown on stdin EOF. Additional tests verify overlapping API reads, released query locks, cancelled HTTP requests, single-refresh concurrency and asynchronous lock contention. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
+Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, scoped pagination, account-code/UUID lookup, search windows beyond 50 matches, inclusive due-date/overdue filters, summary totals, financial totals, safe errors and administration selection. Subprocess tests exercise MCP initialization, tool discovery, parallel tool calls, company search, open-item queries, structured results, tool errors, scope changes, cancellation during token rotation and clean shutdown on stdin EOF. Additional tests verify overlapping API reads, released query locks, cancelled HTTP requests, single-refresh concurrency and asynchronous lock contention. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
 
 ## References
 

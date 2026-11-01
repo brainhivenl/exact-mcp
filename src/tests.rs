@@ -928,6 +928,10 @@ fn open_item(hid: i64, currency: &str, amount: Value) -> Value {
     })
 }
 
+fn open_items_args() -> crate::financial::GetOpenItems {
+    serde_json::from_value(json!({"account_id": COMPANY_ID, "side": "payable"})).unwrap()
+}
+
 async fn financial_backend(base: &Url) -> (TempDir, crate::financial::Backend) {
     let directory = tempdir().unwrap();
     {
@@ -950,6 +954,7 @@ async fn company_search_escapes_odata_and_reports_ambiguous_truncated_matches() 
         .search_accounts(crate::financial::SearchAccounts {
             query: "  O'Neill & Sons  ".into(),
             limit: Some(2),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -965,7 +970,8 @@ async fn company_search_escapes_odata_and_reports_ambiguous_truncated_matches() 
     let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
     assert_eq!(url.path(), "/api/v1/42/crm/Accounts");
     assert_eq!(parameters["$filter"], "substringof('O''Neill & Sons',Name)");
-    assert_eq!(parameters["$top"], "3");
+    assert_eq!(parameters["$orderby"], "Name,Code,ID");
+    assert_eq!(result["next_offset"], 2);
     assert!(requests[0].target.starts_with("GET "));
 }
 
@@ -996,6 +1002,7 @@ async fn outstanding_items_sum_decimal_amounts_and_keep_currencies_and_transit_s
         .get_open_items(crate::financial::GetOpenItems {
             account_id: COMPANY_ID.into(),
             side: crate::financial::Side::Payable,
+            ..open_items_args()
         })
         .await
         .unwrap();
@@ -1043,6 +1050,7 @@ async fn receivables_use_their_own_endpoint_and_return_a_complete_empty_report()
         .get_open_items(crate::financial::GetOpenItems {
             account_id: COMPANY_ID.into(),
             side: crate::financial::Side::Receivable,
+            ..open_items_args()
         })
         .await
         .unwrap();
@@ -1070,7 +1078,11 @@ async fn financial_queries_reject_invalid_inputs_before_network_access() {
         ("x".into(), Some(51)),
     ] {
         let error = backend
-            .search_accounts(crate::financial::SearchAccounts { query, limit })
+            .search_accounts(crate::financial::SearchAccounts {
+                query,
+                limit,
+                ..Default::default()
+            })
             .await
             .err()
             .unwrap();
@@ -1080,6 +1092,7 @@ async fn financial_queries_reject_invalid_inputs_before_network_access() {
         .get_open_items(crate::financial::GetOpenItems {
             account_id: "company name' or true".into(),
             side: crate::financial::Side::Payable,
+            ..open_items_args()
         })
         .await
         .err()
@@ -1128,6 +1141,7 @@ async fn financial_server_requires_selection_and_rejects_scope_changes() {
             .search_accounts(crate::financial::SearchAccounts {
                 query: "X".into(),
                 limit: None,
+                ..Default::default()
             })
             .await
             .err()
@@ -1154,7 +1168,8 @@ async fn outstanding_items_reject_wrong_accounts_duplicates_and_missing_currenci
             backend
                 .get_open_items(crate::financial::GetOpenItems {
                     account_id: COMPANY_ID.into(),
-                    side: crate::financial::Side::Payable
+                    side: crate::financial::Side::Payable,
+                    ..open_items_args()
                 })
                 .await
                 .is_err()
@@ -1171,6 +1186,7 @@ async fn unknown_account_is_not_reported_as_having_zero_debt() {
         .get_open_items(crate::financial::GetOpenItems {
             account_id: COMPANY_ID.into(),
             side: crate::financial::Side::Payable,
+            ..open_items_args()
         })
         .await
         .err()
@@ -1444,6 +1460,7 @@ async fn account_search_accepts_exacts_unwrapped_collection_response() {
             .search_accounts(crate::financial::SearchAccounts {
                 query: "Company".into(),
                 limit: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1467,6 +1484,7 @@ async fn unwrapped_final_page_is_combined_with_wrapped_paginated_rows() {
         .get_open_items(crate::financial::GetOpenItems {
             account_id: COMPANY_ID.into(),
             side: crate::financial::Side::Payable,
+            ..open_items_args()
         })
         .await
         .unwrap();
@@ -1474,4 +1492,207 @@ async fn unwrapped_final_page_is_combined_with_wrapped_paginated_rows() {
     assert_eq!(result["items"].as_array().unwrap().len(), 2);
     assert_eq!(result["totals_by_currency"]["EUR"]["net_open_amount"], "3");
     assert_eq!(server.finish().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_search_supports_exact_codes_and_uuids() {
+    for (field, query, filter) in [
+        ("code", "  A'1001  ", "Code eq 'A''1001'".to_owned()),
+        ("id", COMPANY_ID, format!("ID eq guid'{COMPANY_ID}'")),
+    ] {
+        let server = Server::new(vec![company_response()]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let args = serde_json::from_value(json!({"query": query, "match_by": field})).unwrap();
+        let result = serde_json::to_value(backend.search_accounts(args).await.unwrap()).unwrap();
+        assert_eq!(result["match_by"], field);
+        assert_eq!(result["offset"], 0);
+        assert_eq!(result["has_more"], false);
+        assert_eq!(result["next_offset"], Value::Null);
+        let requests = server.finish();
+        let url = server_url(requests[0].target.split_whitespace().nth(1).unwrap());
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(parameters["$filter"], filter);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_search_paginates_beyond_fifty_using_exact_next_links() {
+    let accounts: Vec<_> = (0..65)
+        .map(|index| {
+            let mut account = company();
+            account["Code"] = json!(format!("{index:04}"));
+            account
+        })
+        .collect();
+    for (offset, limit, count, next) in [
+        (0, 50, 50, Some(50)),
+        (50, 10, 10, Some(60)),
+        (60, 10, 5, None),
+        (70, 10, 0, None),
+    ] {
+        let server = Server::new(vec![
+            Response::json(json!({"d": {"results": accounts[..40], "__next": "?page=2"}})),
+            Response::json(json!({"d": accounts[40..] })),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let args =
+            serde_json::from_value(json!({"query": "Company", "offset": offset, "limit": limit}))
+                .unwrap();
+        let result = serde_json::to_value(backend.search_accounts(args).await.unwrap()).unwrap();
+        assert_eq!(result["accounts"].as_array().unwrap().len(), count);
+        assert_eq!(result["next_offset"], json!(next));
+        assert_eq!(result["has_more"], next.is_some());
+        if count > 0 {
+            assert_eq!(result["accounts"][0]["code"], format!("{offset:04}"));
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].target.contains("?page=2"));
+        assert!(!requests[0].target.contains("$skip"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_search_stops_after_finding_one_extra_match() {
+    let server = Server::new(vec![Response::json(json!({"d": {
+        "results": [company(), company()], "__next": "?page=2"
+    }}))]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let args = serde_json::from_value(json!({"query": "Company", "limit": 1})).unwrap();
+    let result = serde_json::to_value(backend.search_accounts(args).await.unwrap()).unwrap();
+    assert_eq!(result["next_offset"], 1);
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_modes_offsets_and_due_date_ranges_are_validated_before_network_access() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for args in [
+        json!({"query": "not-a-uuid", "match_by": "id"}),
+        json!({"query": "Company", "offset": u32::MAX}),
+    ] {
+        let error = backend
+            .search_accounts(serde_json::from_value(args).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.to_string().contains("request failed"));
+    }
+    for args in [
+        json!({"query": "Company", "match_by": "unknown"}),
+        json!({"query": "Company", "offset": -1}),
+    ] {
+        assert!(serde_json::from_value::<crate::financial::SearchAccounts>(args).is_err());
+    }
+    let args = serde_json::from_value(json!({
+        "account_id": COMPANY_ID, "side": "payable",
+        "due_date_from": "2026-02-01", "due_date_to": "2026-01-01"
+    }))
+    .unwrap();
+    let error = backend.get_open_items(args).await.err().unwrap();
+    assert!(error.to_string().contains("due_date_from"));
+    for date in ["2026-02-30", "tomorrow", "2026-01-01T00:00:00Z"] {
+        assert!(
+            serde_json::from_value::<crate::financial::GetOpenItems>(json!({
+                "account_id": COMPANY_ID, "side": "payable", "due_date_to": date
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_item_date_filters_and_summaries_cover_all_matching_pages() {
+    let mut first = open_item(1, "EUR", json!(10));
+    first["DueDate"] = json!("2000-01-01");
+    let mut second = open_item(2, "EUR", json!(-2));
+    second["DueDate"] = json!("2000-01-02");
+    let mut third = open_item(3, "USD", json!(7));
+    third["DueDate"] = json!("2000-01-02");
+    let mut unknown = open_item(4, "EUR", json!(100));
+    unknown["DueDate"] = Value::Null;
+    let mut future = open_item(5, "EUR", json!(200));
+    future["DueDate"] = json!("9999-01-01");
+    let mut today = open_item(6, "EUR", json!(300));
+    today["DueDate"] = json!(chrono::Local::now().date_naive().to_string());
+    for (filters, count, euros, dollars) in [
+        (json!({}), 6, Some("608"), Some("7")),
+        (
+            json!({"due_date_from": "2000-01-02", "due_date_to": "2000-01-02"}),
+            2,
+            Some("-2"),
+            Some("7"),
+        ),
+        (json!({"due_date_to": "2000-01-01"}), 1, Some("10"), None),
+        (json!({"due_date_from": "9999-01-01"}), 1, Some("200"), None),
+        (json!({"overdue_only": true}), 3, Some("8"), Some("7")),
+        (
+            json!({"overdue_only": true, "due_date_from": "9999-01-01"}),
+            0,
+            None,
+            None,
+        ),
+    ] {
+        for summary_only in [false, true] {
+            let server = Server::new(vec![
+                company_response(),
+                Response::json(json!({"d": {"results": [first, second], "__next": "?page=2"}})),
+                Response::json(json!({"d": [third, unknown, future, today]})),
+            ]);
+            let (_directory, backend) = financial_backend(&server.base).await;
+            let mut args = filters.clone();
+            args["account_id"] = json!(COMPANY_ID);
+            args["side"] = json!("payable");
+            args["summary_only"] = json!(summary_only);
+            let result = serde_json::to_value(
+                backend
+                    .get_open_items(serde_json::from_value(args).unwrap())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result["source_item_count"], 6);
+            assert_eq!(result["matched_item_count"], count);
+            assert_eq!(result["summary_only"], summary_only);
+            assert_eq!(result["filters"]["due_date_from"], filters["due_date_from"]);
+            assert_eq!(result["filters"]["due_date_to"], filters["due_date_to"]);
+            assert_eq!(
+                result["filters"]["overdue_only"],
+                filters.get("overdue_only").unwrap_or(&json!(false)).clone()
+            );
+            assert_eq!(
+                result["totals_by_currency"]["EUR"]["net_open_amount"],
+                json!(euros)
+            );
+            assert_eq!(
+                result["totals_by_currency"]["USD"]["net_open_amount"],
+                json!(dollars)
+            );
+            if summary_only {
+                assert!(result.get("items").is_none());
+            } else {
+                assert_eq!(result["items"].as_array().unwrap().len(), count);
+            }
+            assert_eq!(server.finish().len(), 3);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_summaries_still_reject_invalid_excluded_rows() {
+    let server = Server::new(vec![
+        company_response(),
+        Response::json(
+            json!({"d": [open_item(1, "EUR", json!(10)), open_item(1, "EUR", json!(10))]}),
+        ),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let args = serde_json::from_value(json!({
+        "account_id": COMPANY_ID, "side": "payable",
+        "due_date_from": "9999-01-01", "summary_only": true
+    }))
+    .unwrap();
+    let error = backend.get_open_items(args).await.err().unwrap();
+    assert!(error.to_string().contains("duplicate"));
+    assert_eq!(server.finish().len(), 2);
 }

@@ -154,7 +154,25 @@ impl ExactClient {
         self.refreshes.wait().await;
     }
 
-    pub async fn get_collection<T: DeserializeOwned>(&self, mut url: Url) -> Result<Vec<T>> {
+    pub async fn get_collection<T: DeserializeOwned>(&self, url: Url) -> Result<Vec<T>> {
+        self.read_collection(url, 0, None).await
+    }
+
+    pub async fn get_collection_window<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<T>> {
+        self.read_collection(url, offset, Some(limit)).await
+    }
+
+    async fn read_collection<T: DeserializeOwned>(
+        &self,
+        mut url: Url,
+        mut offset: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<T>> {
         let resource_path = url.path().to_owned();
         let mut seen = HashSet::new();
         let mut results = Vec::new();
@@ -202,7 +220,13 @@ impl ExactClient {
                 Page::Rows(rows) => (rows, None),
                 Page::Paged { results, next } => (results, next),
             };
-            results.extend(rows);
+            let skipped = offset.min(rows.len());
+            offset -= skipped;
+            let remaining = limit.map_or(usize::MAX, |limit| limit - results.len());
+            results.extend(rows.into_iter().skip(skipped).take(remaining));
+            if limit.is_some_and(|limit| results.len() == limit) {
+                return Ok(results);
+            }
             match next {
                 Some(next) => url = url.join(&next).context("Invalid Exact pagination URL")?,
                 None => return Ok(results),

@@ -16,7 +16,7 @@ struct FinanceServer {
 #[tool_router]
 impl FinanceServer {
     #[tool(
-        description = "Search companies by name in the selected Exact administration. Returns account UUIDs, supplier/sales-allowed flags and names. Never guess between ambiguous matches; ask the user to disambiguate before calling get_open_items.",
+        description = "Search companies by name fragment (default), exact account code, or UUID in the selected Exact administration. Use match_by to choose the field and next_offset to retrieve further matches. Results include account UUIDs, supplier/sales-allowed flags and names. Never guess between ambiguous matches; ask the user to disambiguate before calling get_open_items.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -32,7 +32,7 @@ impl FinanceServer {
     }
 
     #[tool(
-        description = "Get all current outstanding payables OR receivables for one Exact account UUID. Returns invoice references, due dates, signed decimal amounts and per-currency totals. In-transit amounts are separate, not subtracted and not proof of settlement. Never offset currencies or payable/receivable sides. Monetary signs are preserved as reported by Exact; inspect positive and negative rows rather than guessing whether a negative row is a credit note or unmatched payment.",
+        description = "Get current outstanding payables OR receivables for one Exact account UUID. Optional inclusive due_date_from/due_date_to (YYYY-MM-DD) and overdue_only filters exclude unknown due dates. Totals cover all matching items across all pages, not excluded items; filters and before/after counts are returned. Set summary_only to omit rows without truncating totals. Otherwise returns invoice references, due dates and signed decimal amounts. In-transit amounts are separate, not subtracted and not proof of settlement. Never offset currencies or payable/receivable sides. Preserve Exact's signs; do not guess whether negative rows are credit notes or unmatched payments.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

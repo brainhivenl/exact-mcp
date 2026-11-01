@@ -209,6 +209,24 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             Some("search_accounts" | "get_open_items")
         ));
     }
+    let search_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "search_accounts")
+        .unwrap()["inputSchema"]["properties"];
+    assert!(search_schema["match_by"].is_object());
+    assert!(search_schema["offset"].is_object());
+    let report_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "get_open_items")
+        .unwrap()["inputSchema"]["properties"];
+    for field in [
+        "due_date_from",
+        "due_date_to",
+        "overdue_only",
+        "summary_only",
+    ] {
+        assert!(report_schema[field].is_object());
+    }
     let search = process.request(
         3,
         "tools/call",
@@ -419,4 +437,51 @@ fn cancelled_mcp_tool_and_stdin_eof_still_save_rotated_tokens_before_exit() {
     assert_eq!(stored["tokens"]["access_token"], "rotated-access");
     assert_eq!(stored["administration"]["Code"], 42);
     api.join().unwrap();
+}
+
+#[test]
+fn stdio_exact_code_search_and_filtered_summary_return_scoped_totals() {
+    let (base, api) = api_server();
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let search = process.request(2, "tools/call", json!({
+        "name": "search_accounts", "arguments": {"query": "1001", "match_by": "code", "offset": 0, "limit": 1}
+    }));
+    assert_ne!(search["result"]["isError"], true, "{search}");
+    let search_result = &search["result"]["structuredContent"];
+    assert_eq!(search_result["accounts"][0]["id"], ACCOUNT_ID);
+    assert_eq!(search_result["match_by"], "code");
+    assert_eq!(search_result["has_more"], false);
+    assert_eq!(search_result["next_offset"], Value::Null);
+    let report = process.request(
+        3,
+        "tools/call",
+        json!({
+            "name": "get_open_items", "arguments": {
+                "account_id": ACCOUNT_ID, "side": "receivable", "due_date_from": "2000-01-01",
+                "due_date_to": "2000-01-01", "overdue_only": true, "summary_only": true
+            }
+        }),
+    );
+    assert_ne!(report["result"]["isError"], true, "{report}");
+    let result = &report["result"]["structuredContent"];
+    assert!(result.get("items").is_none());
+    assert_eq!(result["source_item_count"], 2);
+    assert_eq!(result["matched_item_count"], 2);
+    assert_eq!(result["filters"]["due_date_to"], "2000-01-01");
+    assert_eq!(
+        result["totals_by_currency"]["EUR"]["net_open_amount"],
+        "0.3"
+    );
+    let targets = api.join().unwrap();
+    let url = reqwest::Url::parse(&format!(
+        "{base}{}",
+        targets[0].split_whitespace().nth(1).unwrap()
+    ))
+    .unwrap();
+    let parameters: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(parameters["$filter"], "Code eq '1001'");
+    assert!(targets[2].contains("ReceivablesListByAccount"));
+    process.shutdown();
 }
