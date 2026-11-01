@@ -126,6 +126,7 @@ pub struct OpenItemsResult {
     as_of_utc_offset: String,
     account: Account,
     side: Side,
+    amount_basis: &'static str,
     filters: OpenItemFilters,
     source_item_count: usize,
     matched_item_count: usize,
@@ -222,7 +223,7 @@ impl Backend {
         let escaped = query.replace('\'', "''");
         let filter = match args.match_by {
             AccountSearchField::Name => format!("substringof('{escaped}',Name)"),
-            AccountSearchField::Code => format!("Code eq '{escaped}'"),
+            AccountSearchField::Code => format!("trim(Code) eq '{escaped}'"),
             AccountSearchField::Id => {
                 let id =
                     Uuid::parse_str(query).context("ID search requires an Exact account UUID")?;
@@ -355,6 +356,7 @@ impl Backend {
             as_of_utc_offset: current.offset().to_string(),
             account,
             side: args.side,
+            amount_basis: "exact_report_currency",
             filters: OpenItemFilters {
                 due_date_from: args.due_date_from,
                 due_date_to: args.due_date_to,
@@ -365,7 +367,7 @@ impl Backend {
             summary_only: args.summary_only,
             items,
             totals_by_currency: totals,
-            interpretation: "Totals cover only items matching the echoed filters, across all fetched pages; source_item_count is before filtering and matched_item_count is after filtering. Summary-only responses omit rows, not matching amounts. Current outstanding-item report, not a historical snapshot or proof of bank settlement. Amounts are decimal strings with Exact's signs preserved; positive and negative rows are shown separately, without classifying a negative row as a credit note versus unmatched payment. In-transit amounts are reported separately and NOT subtracted from open amounts. Null transit amounts and missing due dates remain unknown. Overdue means due before the local machine's as_of_date; signed overdue totals can include negative rows. Different currencies and payable/receivable sides are never offset. Source data can change while pages are fetched.",
+            interpretation: "Totals cover only items matching the echoed filters, across all fetched pages; source_item_count is before filtering and matched_item_count is after filtering. Summary-only responses omit rows, not matching amounts. Current outstanding-item report, not a historical snapshot or proof of bank settlement. Amounts and currency codes are reported by Exact and can be in the administration's reporting currency rather than the original invoice currency; this server does not convert currencies or expose original foreign-currency amounts. For purchase entries, invoice_number is Exact's entry number, not the supplier's invoice reference; use your_ref when available. Amounts are decimal strings with Exact's signs preserved; positive and negative rows are shown separately, without classifying a negative row as a credit note versus unmatched payment. In-transit amounts are reported separately and NOT subtracted from open amounts. Null transit amounts and missing due dates remain unknown. Overdue means due before the local machine's as_of_date; signed overdue totals can include negative rows. Different currencies and payable/receivable sides are never offset. Source data can change while pages are fetched.",
         })
     }
 

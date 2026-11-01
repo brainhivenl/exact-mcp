@@ -469,6 +469,7 @@ fn stdio_exact_code_search_and_filtered_summary_return_scoped_totals() {
     assert!(result.get("items").is_none());
     assert_eq!(result["source_item_count"], 2);
     assert_eq!(result["matched_item_count"], 2);
+    assert_eq!(result["amount_basis"], "exact_report_currency");
     assert_eq!(result["filters"]["due_date_to"], "2000-01-01");
     assert_eq!(
         result["totals_by_currency"]["EUR"]["net_open_amount"],
@@ -481,7 +482,7 @@ fn stdio_exact_code_search_and_filtered_summary_return_scoped_totals() {
     ))
     .unwrap();
     let parameters: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-    assert_eq!(parameters["$filter"], "Code eq '1001'");
+    assert_eq!(parameters["$filter"], "trim(Code) eq '1001'");
     assert!(targets[2].contains("ReceivablesListByAccount"));
     process.shutdown();
 }

@@ -1021,6 +1021,7 @@ async fn outstanding_items_sum_decimal_amounts_and_keep_currencies_and_transit_s
     assert_eq!(result["items"][1]["overdue"], false);
     assert_eq!(result["items"][2]["overdue"], Value::Null);
     assert_eq!(result["side"], "payable");
+    assert_eq!(result["amount_basis"], "exact_report_currency");
     assert!(result["retrieved_at"].as_str().is_some());
     let requests = server.finish();
     assert!(
@@ -1497,14 +1498,23 @@ async fn unwrapped_final_page_is_combined_with_wrapped_paginated_rows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_search_supports_exact_codes_and_uuids() {
     for (field, query, filter) in [
-        ("code", "  A'1001  ", "Code eq 'A''1001'".to_owned()),
+        ("code", "  A'1001  ", "trim(Code) eq 'A''1001'".to_owned()),
+        ("code", "1001", "trim(Code) eq '1001'".to_owned()),
         ("id", COMPANY_ID, format!("ID eq guid'{COMPANY_ID}'")),
     ] {
-        let server = Server::new(vec![company_response()]);
+        let code = if field == "code" {
+            query.trim()
+        } else {
+            "1001"
+        };
+        let mut account = company();
+        account["Code"] = json!(format!("{code:>18}"));
+        let server = Server::new(vec![Response::json(json!({"d": [account]}))]);
         let (_directory, backend) = financial_backend(&server.base).await;
         let args = serde_json::from_value(json!({"query": query, "match_by": field})).unwrap();
         let result = serde_json::to_value(backend.search_accounts(args).await.unwrap()).unwrap();
         assert_eq!(result["match_by"], field);
+        assert_eq!(result["accounts"][0]["code"], format!("{code:>18}"));
         assert_eq!(result["offset"], 0);
         assert_eq!(result["has_more"], false);
         assert_eq!(result["next_offset"], Value::Null);
@@ -1694,5 +1704,35 @@ async fn filtered_summaries_still_reject_invalid_excluded_rows() {
     .unwrap();
     let error = backend.get_open_items(args).await.err().unwrap();
     assert!(error.to_string().contains("duplicate"));
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_report_currency_and_purchase_references_are_explicit() {
+    let mut item = open_item(1, "EUR", json!(12.34));
+    item["InvoiceNumber"] = json!(12345);
+    item["EntryNumber"] = json!(12345);
+    item["YourRef"] = json!("SUPPLIER-FX-001");
+    let server = Server::new(vec![
+        company_response(),
+        Response::json(json!({"d": [item]})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result =
+        serde_json::to_value(backend.get_open_items(open_items_args()).await.unwrap()).unwrap();
+    assert_eq!(result["amount_basis"], "exact_report_currency");
+    assert_eq!(result["items"][0]["amount"], "12.34");
+    assert_eq!(result["items"][0]["currency"], "EUR");
+    assert_eq!(result["items"][0]["invoice_number"], 12345);
+    assert_eq!(result["items"][0]["entry_number"], 12345);
+    assert_eq!(result["items"][0]["your_ref"], "SUPPLIER-FX-001");
+    assert_eq!(
+        result["totals_by_currency"]["EUR"]["net_open_amount"],
+        "12.34"
+    );
+    let interpretation = result["interpretation"].as_str().unwrap();
+    assert!(interpretation.contains("rather than the original invoice currency"));
+    assert!(interpretation.contains("this server does not convert currencies"));
+    assert!(interpretation.contains("invoice_number is Exact's entry number"));
     assert_eq!(server.finish().len(), 2);
 }
