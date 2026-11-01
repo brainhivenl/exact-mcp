@@ -373,6 +373,13 @@ impl Backend {
         self.client.shutdown().await;
     }
 
+    pub async fn get_invoice_details(
+        &self,
+        args: crate::invoice::GetInvoiceDetails,
+    ) -> Result<crate::invoice::InvoiceDetailsResult> {
+        crate::invoice::get_details(&self.client, &self.administration, args).await
+    }
+
     pub async fn search_accounts(&self, args: SearchAccounts) -> Result<AccountSearchResult> {
         let query = args.query.trim();
         ensure!(
@@ -650,7 +657,7 @@ impl Backend {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Money(Decimal);
+pub(crate) struct Money(Decimal);
 
 impl Money {
     fn add(&mut self, other: Self) -> Result<()> {
@@ -689,7 +696,8 @@ impl<'de> Deserialize<'de> for Money {
     }
 }
 
-struct ExactDate(NaiveDate);
+#[derive(Serialize)]
+pub(crate) struct ExactDate(NaiveDate);
 
 impl<'de> Deserialize<'de> for ExactDate {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {

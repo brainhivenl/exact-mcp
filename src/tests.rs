@@ -1177,6 +1177,12 @@ async fn financial_server_requires_selection_and_rejects_scope_changes() {
             .err()
             .unwrap();
         assert!(error.to_string().contains("restart"));
+        let error = backend
+            .get_invoice_details(invoice_args("payable"))
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("restart"));
     }
 }
 
@@ -2318,4 +2324,382 @@ async fn zero_net_aging_buckets_retain_both_positive_and_negative_rows() {
     assert_eq!(bucket["negative_open_amount"], "-0.1");
     assert_eq!(result["matched_account_count"], 1);
     assert_eq!(server.finish().len(), 1);
+}
+
+const INVOICE_ENTRY_ID: &str = "44444444-4444-4444-4444-444444444444";
+const INVOICE_LINE_ID: &str = "66666666-6666-6666-6666-666666666666";
+
+fn invoice_header(side: &str) -> Value {
+    let mut header = json!({
+        "EntryID": INVOICE_ENTRY_ID, "Division": 42, "EntryNumber": 12345,
+        "Journal": if side == "payable" { "60" } else { "70" },
+        "Currency": "USD", "AmountDC": if side == "payable" { -90.0 } else { 108.9 },
+        "AmountFC": if side == "payable" { -100 } else { 121 },
+        "VATAmountDC": if side == "payable" { 0.0 } else { 18.9 },
+        "VATAmountFC": if side == "payable" { 0 } else { 21 }, "Rate": 0.9,
+        "EntryDate": "/Date(946684800000)/", "DueDate": "2000-01-31",
+        "InvoiceNumber": 12345, "YourRef": "INVOICE-001", "Description": "Invoice",
+        "Type": if side == "payable" { 30 } else { 20 },
+        "TypeDescription": "Accounting entry", "Status": 50, "StatusDescription": "Processed",
+        "Reversal": false, "Document": "55555555-5555-5555-5555-555555555555",
+        "DocumentNumber": 1, "DocumentSubject": "Linked invoice document"
+    });
+    let party = if side == "payable" {
+        "Supplier"
+    } else {
+        "Customer"
+    };
+    header[party] = json!(COMPANY_ID);
+    header[format!("{party}Name")] = json!("Company X");
+    header
+}
+
+fn invoice_line() -> Value {
+    json!({
+        "ID": INVOICE_LINE_ID, "EntryID": INVOICE_ENTRY_ID, "Division": 42,
+        "LineNumber": 1, "Description": "Ledger detail", "GLAccount": "77777777-7777-7777-7777-777777777777",
+        "GLAccountCode": "4000", "GLAccountDescription": "Services", "Quantity": 0.125,
+        "AmountDC": 90, "AmountFC": 100, "VATAmountDC": 18.9, "VATAmountFC": 21,
+        "VATBaseAmountDC": 90, "VATBaseAmountFC": 100,
+        "VATCode": "1", "VATCodeDescription": "Standard VAT", "VATPercentage": 0.21
+    })
+}
+
+fn invoice_args(side: &str) -> crate::invoice::GetInvoiceDetails {
+    serde_json::from_value(json!({
+        "account_id": COMPANY_ID, "side": side, "entry_number": 12345,
+        "journal_code": if side == "payable" { "60" } else { "70" }
+    }))
+    .unwrap()
+}
+
+fn division_currency_response() -> Response {
+    Response::json(json!({"d": [{"Code": 42, "Currency": "EUR"}]}))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_details_scope_headers_and_paginated_lines_and_label_both_currencies() {
+    for side in ["payable", "receivable"] {
+        let mut first = invoice_line();
+        first["AmountFC"] = json!(60);
+        first["AmountDC"] = json!(54);
+        first["VATAmountFC"] = json!(12.6);
+        first["VATAmountDC"] = json!(11.34);
+        first["VATBaseAmountFC"] = json!(60);
+        first["VATBaseAmountDC"] = json!(54);
+        first["LineNumber"] = json!(2);
+        let mut second = invoice_line();
+        second["ID"] = json!("88888888-8888-8888-8888-888888888888");
+        second["AmountFC"] = json!(40);
+        second["AmountDC"] = json!(36);
+        second["VATAmountFC"] = json!(8.4);
+        second["VATAmountDC"] = json!(7.56);
+        second["VATBaseAmountFC"] = json!(40);
+        second["VATBaseAmountDC"] = json!(36);
+        let server = Server::new(vec![
+            Response::json(json!({"d": [invoice_header(side)]})),
+            division_currency_response(),
+            Response::json(json!({"d": {"results": [first], "__next": "?page=2"}})),
+            Response::json(json!({"d": [second]})),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let result = serde_json::to_value(
+            backend
+                .get_invoice_details(invoice_args(side))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["administration"]["Code"], 42);
+        assert_eq!(result["side"], side);
+        assert_eq!(result["default_currency"], "EUR");
+        assert_eq!(result["amount_basis"], "exact_accounting_entry");
+        assert_eq!(result["entry"]["currency"], "USD");
+        assert_eq!(result["entry"]["account_id"], COMPANY_ID);
+        assert_eq!(result["entry"]["account_name"], "Company X");
+        assert_eq!(
+            result["entry"]["amount_default_currency"],
+            if side == "payable" { "-90.0" } else { "108.9" }
+        );
+        assert_eq!(
+            result["entry"]["amount_transaction_currency"],
+            if side == "payable" { "-100" } else { "121" }
+        );
+        assert_eq!(
+            result["entry"]["vat_amount_transaction_currency"],
+            if side == "payable" { "0" } else { "21" }
+        );
+        assert_eq!(result["lines"][0]["vat_amount_transaction_currency"], "8.4");
+        assert_eq!(result["entry"]["rate"], "0.9");
+        assert_eq!(result["entry"]["entry_date"], "2000-01-01");
+        assert_eq!(result["entry"]["due_date"], "2000-01-31");
+        assert_eq!(
+            result["entry"]["document_id"],
+            "55555555-5555-5555-5555-555555555555"
+        );
+        assert_eq!(result["line_count"], 2);
+        assert_eq!(result["lines"][0]["line_number"], 1);
+        assert_eq!(result["lines"][1]["line_number"], 2);
+        assert_eq!(result["lines"][0]["quantity"], "0.125");
+        assert_eq!(result["lines"][0]["vat_percentage"], "0.21");
+        assert_eq!(result["lines"][0]["amount_transaction_currency"], "40");
+        assert!(
+            result["interpretation"]
+                .as_str()
+                .unwrap()
+                .contains("NOT current outstanding balances")
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.target.starts_with("GET "))
+        );
+        let header = server_url(requests[0].target.split_whitespace().nth(1).unwrap());
+        let path = if side == "payable" {
+            "purchaseentry/PurchaseEntries"
+        } else {
+            "salesentry/SalesEntries"
+        };
+        let party = if side == "payable" {
+            "Supplier"
+        } else {
+            "Customer"
+        };
+        assert_eq!(header.path(), format!("/api/v1/42/{path}"));
+        let parameters: HashMap<_, _> = header.query_pairs().into_owned().collect();
+        let journal = if side == "payable" { "60" } else { "70" };
+        assert_eq!(
+            parameters["$filter"],
+            format!(
+                "EntryNumber eq 12345 and Journal eq '{journal}' and {party} eq guid'{COMPANY_ID}'"
+            )
+        );
+        assert!(parameters["$select"].contains(&format!("{party},{party}Name")));
+        let currency = server_url(requests[1].target.split_whitespace().nth(1).unwrap());
+        assert_eq!(currency.path(), "/api/v1/42/system/Divisions");
+        assert!(
+            currency
+                .query_pairs()
+                .any(|(key, value)| key == "$filter" && value == "Code eq 42")
+        );
+        let lines = server_url(requests[2].target.split_whitespace().nth(1).unwrap());
+        assert!(lines.path().ends_with(if side == "payable" {
+            "/purchaseentry/PurchaseEntryLines"
+        } else {
+            "/salesentry/SalesEntryLines"
+        }));
+        assert!(lines.query_pairs().any(|(key, value)| key == "$filter"
+            && value == format!("EntryID eq guid'{INVOICE_ENTRY_ID}'")));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_details_preserve_negative_precision_and_unknown_values_without_inference() {
+    let mut header = invoice_header("payable");
+    header["AmountFC"] = serde_json::from_str("-9007199254740993.01").unwrap();
+    header["AmountDC"] = Value::Null;
+    header["VATAmountFC"] = Value::Null;
+    header["Rate"] = serde_json::from_str("1e-12").unwrap();
+    header["Type"] = json!(31);
+    header["Status"] = Value::Null;
+    header["Reversal"] = json!(true);
+    header["Document"] = Value::Null;
+    let mut line = invoice_line();
+    line["AmountFC"] = serde_json::from_str("-9007199254740993.01").unwrap();
+    line["Quantity"] = serde_json::from_str("9007199254740993.01").unwrap();
+    line["AmountDC"] = Value::Null;
+    line["VATPercentage"] = Value::Null;
+    let server = Server::new(vec![
+        Response::json(json!({"d": [header]})),
+        division_currency_response(),
+        Response::json(json!({"d": [line]})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = serde_json::to_value(
+        backend
+            .get_invoice_details(invoice_args("payable"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        result["entry"]["amount_transaction_currency"],
+        "-9007199254740993.01"
+    );
+    assert_eq!(
+        result["lines"][0]["amount_transaction_currency"],
+        "-9007199254740993.01"
+    );
+    assert_eq!(result["lines"][0]["quantity"], "9007199254740993.01");
+    assert_eq!(result["entry"]["amount_default_currency"], Value::Null);
+    assert_eq!(
+        result["entry"]["vat_amount_transaction_currency"],
+        Value::Null
+    );
+    assert_eq!(result["lines"][0]["amount_default_currency"], Value::Null);
+    assert_eq!(result["lines"][0]["vat_percentage"], Value::Null);
+    assert_eq!(result["entry"]["status_code"], Value::Null);
+    assert_eq!(result["entry"]["type_code"], 31);
+    assert_eq!(result["entry"]["reversal"], true);
+    assert_eq!(server.finish().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_headers_must_match_uniquely_before_reading_currency_or_lines() {
+    let valid = invoice_header("payable");
+    let mut cases = vec![vec![], vec![valid.clone(), valid.clone()]];
+    for (key, value) in [
+        ("Supplier", json!("22222222-2222-2222-2222-222222222222")),
+        ("Division", json!(99)),
+        ("Journal", json!("70")),
+        ("EntryNumber", json!(54321)),
+        ("EntryID", json!("00000000-0000-0000-0000-000000000000")),
+        ("Currency", json!(" ")),
+    ] {
+        let mut header = valid.clone();
+        header[key] = value;
+        cases.push(vec![header]);
+    }
+    for entries in cases {
+        let server = Server::new(vec![Response::json(json!({"d": entries}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .get_invoice_details(invoice_args("payable"))
+                .await
+                .is_err()
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_lines_must_belong_to_the_entry_and_division_without_duplicates() {
+    let valid = invoice_line();
+    let mut cases = vec![vec![valid.clone(), valid.clone()]];
+    for (key, value) in [
+        ("EntryID", json!("22222222-2222-2222-2222-222222222222")),
+        ("Division", json!(99)),
+        ("ID", json!("00000000-0000-0000-0000-000000000000")),
+    ] {
+        let mut line = valid.clone();
+        line[key] = value;
+        cases.push(vec![line]);
+    }
+    for lines in cases {
+        let server = Server::new(vec![
+            Response::json(json!({"d":[invoice_header("receivable")]})),
+            division_currency_response(),
+            Response::json(json!({"d":lines})),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .get_invoice_details(invoice_args("receivable"))
+                .await
+                .is_err()
+        );
+        assert_eq!(server.finish().len(), 3);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_default_currency_must_resolve_without_using_the_transaction_currency_as_fallback()
+{
+    for divisions in [
+        json!([]),
+        json!([{"Code":99,"Currency":"EUR"}]),
+        json!([{"Code":42,"Currency":" "}]),
+        json!([{"Code":42,"Currency":"EUR"},{"Code":42,"Currency":"USD"}]),
+    ] {
+        let server = Server::new(vec![
+            Response::json(json!({"d":[invoice_header("payable")]})),
+            Response::json(json!({"d":divisions})),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .get_invoice_details(invoice_args("payable"))
+                .await
+                .is_err()
+        );
+        assert_eq!(server.finish().len(), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_queries_escape_journals_and_reject_invalid_inputs_before_network_access() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for (entry_number, journal, account) in [
+        (0, "60", COMPANY_ID),
+        (-1, "60", COMPANY_ID),
+        (i64::from(i32::MAX) + 1, "60", COMPANY_ID),
+        (1, "", COMPANY_ID),
+        (1, "60", "company name"),
+        (1, "60", "00000000-0000-0000-0000-000000000000"),
+    ] {
+        let args=serde_json::from_value(json!({"account_id":account,"side":"payable","entry_number":entry_number,"journal_code":journal})).unwrap();
+        let error = backend.get_invoice_details(args).await.err().unwrap();
+        assert!(!format!("{error:#}").contains("request failed"));
+    }
+    for args in [
+        json!({"account_id": COMPANY_ID, "side": "both", "entry_number": 12345, "journal_code": "60"}),
+        json!({"account_id": COMPANY_ID, "side": "payable", "entry_number": 12345}),
+        json!({"account_id": COMPANY_ID, "side": "payable", "entry_number": 12345, "journal_code": "60", "url": "https://example.invalid"}),
+    ] {
+        assert!(serde_json::from_value::<crate::invoice::GetInvoiceDetails>(args).is_err());
+    }
+    let mut header = invoice_header("payable");
+    header["Journal"] = json!("A'B");
+    let server = Server::new(vec![
+        Response::json(json!({"d":[header]})),
+        division_currency_response(),
+        Response::json(json!({"d":[]})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let mut args = invoice_args("payable");
+    args.journal_code = "  A'B  ".into();
+    let result = serde_json::to_value(backend.get_invoice_details(args).await.unwrap()).unwrap();
+    assert_eq!(result["line_count"], 0);
+    let requests = server.finish();
+    let url = server_url(requests[0].target.split_whitespace().nth(1).unwrap());
+    assert!(
+        url.query_pairs()
+            .any(|(key, value)| key == "$filter" && value.contains("Journal eq 'A''B'"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_permission_and_pagination_errors_return_no_partial_details_or_response_bodies() {
+    for failure_at in 0..3 {
+        let mut responses = vec![
+            Response::json(json!({"d":[invoice_header("payable")]})),
+            division_currency_response(),
+            Response::json(json!({"d":{"results":[invoice_line()],"__next":"?page=2"}})),
+        ];
+        if failure_at == 0 {
+            responses.clear();
+        } else if failure_at == 1 {
+            responses.truncate(1);
+        }
+        responses.push(Response {
+            status: "403 Forbidden",
+            body: "private token and invoice details".into(),
+            location: None,
+        });
+        let count = responses.len();
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let error = backend
+            .get_invoice_details(invoice_args("payable"))
+            .await
+            .err()
+            .unwrap();
+        let text = format!("{error:#}");
+        assert!(text.contains("403"));
+        assert!(!text.contains("private token and invoice details"));
+        assert_eq!(server.finish().len(), count);
+    }
 }

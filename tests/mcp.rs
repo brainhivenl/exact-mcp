@@ -200,13 +200,18 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 3);
+    assert_eq!(tools.len(), 4);
     for tool in tools {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert_eq!(tool["annotations"]["destructiveHint"], false);
         assert!(matches!(
             tool["name"].as_str(),
-            Some("search_accounts" | "get_open_items" | "get_outstanding_balances")
+            Some(
+                "search_accounts"
+                    | "get_open_items"
+                    | "get_outstanding_balances"
+                    | "get_invoice_details"
+            )
         ));
     }
     let search_schema = &tools
@@ -240,6 +245,13 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
         "offset",
     ] {
         assert!(balances_schema[field].is_object());
+    }
+    let invoice_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "get_invoice_details")
+        .unwrap()["inputSchema"]["properties"];
+    for field in ["account_id", "side", "entry_number", "journal_code"] {
+        assert!(invoice_schema[field].is_object());
     }
     let search = process.request(
         3,
@@ -286,6 +298,11 @@ fn stdio_tool_errors_and_administration_changes_do_not_require_api_access() {
     process.initialize();
     for (id, name, arguments) in [
         (2, "search_accounts", json!({"query": ""})),
+        (
+            8,
+            "get_invoice_details",
+            json!({"account_id": ACCOUNT_ID, "side": "payable", "entry_number": 0, "journal_code": "60"}),
+        ),
         (
             5,
             "get_outstanding_balances",
@@ -334,6 +351,14 @@ fn stdio_tool_errors_and_administration_changes_do_not_require_api_access() {
         "tools/call",
         json!({"name": "get_outstanding_balances", "arguments": {"side": "payable"}}),
     );
+    assert_eq!(response["result"]["isError"], true);
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("restart")
+    );
+    let response = process.request(9, "tools/call", json!({"name": "get_invoice_details", "arguments": {"account_id": ACCOUNT_ID, "side": "payable", "entry_number": 12345, "journal_code": "60"}}));
     assert_eq!(response["result"]["isError"], true);
     assert!(
         response["result"]["content"][0]["text"]
@@ -617,6 +642,75 @@ fn stdio_outstanding_balances_cover_all_pages_and_support_invoice_drilldown() {
             .len(),
         2
     );
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_invoice_accounting_details_preserve_signs_vat_and_currency_context() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let api = thread::spawn(move || {
+        let entry_id = "44444444-4444-4444-4444-444444444444";
+        let responses = [
+            (
+                "/purchaseentry/PurchaseEntries?",
+                json!({"d": [{
+                    "EntryID": entry_id, "Division": 42, "EntryNumber": 12345, "Journal": "60",
+                    "Supplier": ACCOUNT_ID, "SupplierName": "Company X", "Currency": "USD",
+                    "AmountDC": -90, "AmountFC": -100, "VATAmountDC": 0, "VATAmountFC": 0,
+                    "Type": 30, "Reversal": false, "Document": "55555555-5555-5555-5555-555555555555"
+                }]}),
+            ),
+            (
+                "/system/Divisions?",
+                json!({"d": [{"Code": 42, "Currency": "EUR"}]}),
+            ),
+            (
+                "/purchaseentry/PurchaseEntryLines?",
+                json!({"d": [{
+                    "ID": "66666666-6666-6666-6666-666666666666", "EntryID": entry_id,
+                    "Division": 42, "LineNumber": 1, "AmountDC": 90, "AmountFC": 100,
+                    "VATAmountDC": 18.9, "VATAmountFC": 21, "VATPercentage": 0.21, "Quantity": 0.125
+                }]}),
+            ),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"));
+            assert!(target.contains(path), "{target}");
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response = process.request(
+        2,
+        "tools/call",
+        json!({"name": "get_invoice_details", "arguments": {
+            "account_id": ACCOUNT_ID, "side": "payable", "entry_number": 12345, "journal_code": "60"
+        }}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["administration"]["Code"], 42);
+    assert_eq!(result["amount_basis"], "exact_accounting_entry");
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["entry"]["currency"], "USD");
+    assert_eq!(result["entry"]["account_id"], ACCOUNT_ID);
+    assert_eq!(result["entry"]["amount_transaction_currency"], "-100");
+    assert_eq!(result["entry"]["type_code"], 30);
+    assert_eq!(result["entry"]["vat_amount_transaction_currency"], "0");
+    assert_eq!(result["line_count"], 1);
+    assert_eq!(result["lines"][0]["amount_transaction_currency"], "100");
+    assert_eq!(result["lines"][0]["vat_amount_transaction_currency"], "21");
+    assert_eq!(result["lines"][0]["vat_percentage"], "0.21");
+    assert_eq!(result["lines"][0]["quantity"], "0.125");
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    assert!(!response.to_string().contains("fixture-access-token"));
     api.join().unwrap();
     process.shutdown();
 }

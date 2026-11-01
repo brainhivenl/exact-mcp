@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online MCP server with OAuth, explicit administration selection, company search, administration-wide outstanding balances, due-date aging summaries and per-company payables/receivables. Financial operations are read-only; no invoice creation or payment tools are exposed.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company search, administration-wide outstanding balances, due-date aging summaries, per-company payables/receivables and invoice accounting details. Financial operations are read-only; no invoice creation or payment tools are exposed.
 
 ## Setup
 
@@ -13,7 +13,7 @@ Use Nix with flakes enabled, or Rust 1.89 or newer.
    https://exact-mcp.localhost:8400/callback
    ```
 
-3. Make sure the authorizing user/app has access to the administrations you need. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries.
+3. Make sure the authorizing user/app has access to the administrations you need. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries. Invoice accounting drill-down additionally requires **Financial accounting**; it also uses **Organization administration** to resolve the default currency. Existing outstanding-balance tools do not require the additional accounting scope.
 4. With Nix, run the CLI directly (the first invocation builds it):
 
    ```sh
@@ -80,7 +80,7 @@ nix run .#pi
 
 This builds the MCP binary, loads credentials from the environment or the repository's `.env`, registers its exact Nix store path as the project-local `exact` server with direct tool exposure, and starts a fresh interactive Pi session. The secret is inherited through the process environment, not saved in the MCP configuration or requested again at a prompt. Existing Pi credentials, models and user-level configuration are reused unchanged.
 
-The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with three tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
+The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with four tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
 
 ### Other MCP clients
 
@@ -104,6 +104,8 @@ Ensure the MCP host can find `nix` and inherits `EXACT_CLIENT_SECRET` for automa
 - `search_accounts`: `{ "query": "Company X", "limit": 10 }`. Searches name fragments within the selected administration; returns UUIDs, account codes, names, supplier flags and whether sales are allowed. Set `match_by` to `code` for an exact account-code lookup ignoring surrounding padding, or `id` for a UUID lookup; the default is `name`. Exact pads account codes with spaces; returned codes preserve that source value. Limit is 1–50. When `has_more` is true, repeat the same query, field and limit with `offset` set to `next_offset`. Ambiguous matches must be clarified, never silently resolved to the first result. Results use a stable name/code/UUID ordering, but searches are not frozen snapshots: changes between calls can move matches. Offsets are applied while following Exact's pagination links, so later searches reread earlier pages rather than relying on server-side offset support.
 - `get_outstanding_balances`: `{ "side": "receivable" }`. Summarizes all companies with matching outstanding items in the selected administration, without a company lookup. Use `payable` for amounts owed to suppliers. Returns account UUIDs, codes and names, per-account totals and overall totals by reported currency. Supports the same `due_date_from`, `due_date_to` and `overdue_only` filters as `get_open_items`. It always returns summaries, not invoice rows. Use a returned UUID with `get_open_items` to drill down.
 - `get_open_items`: `{ "account_id": "<UUID from search_accounts or get_outstanding_balances>", "side": "payable" }`. Use `receivable` for amounts owed by the company. Returns all pages of current open items with invoice/entry references, due dates, descriptions and per-currency totals. Optional `due_date_from` and `due_date_to` are inclusive `YYYY-MM-DD` due-date bounds; `overdue_only: true` selects items due before the local `as_of_date`. These filters intersect, and any active due-date/overdue filter excludes items without a due date. Set `summary_only: true` to omit the `items` field while retaining complete matching totals.
+
+- `get_invoice_details`: `{ "account_id": "<UUID>", "side": "payable", "entry_number": 12345, "journal_code": "60" }`. Use the account UUID, side, entry number and journal code from the **same** `get_open_items` result; the example numbers are placeholders, not values to guess. Returns a purchase (`payable`) or sales (`receivable`) accounting header, all entry lines, both currency contexts and the header's linked-document reference. It does not download documents or determine current open balances.
 
 Open-item results echo `filters`, `summary_only`, `source_item_count` (before filtering), and `matched_item_count` (after filtering). **All totals cover only matching items**, never the excluded balance. Filters and summary mode do not reduce source API reads: all pages are fetched and checked before totals are returned. For example, a compact overdue receivables query is:
 
@@ -135,6 +137,16 @@ Each call fetches the full source report before filtering, grouping and paginati
 The server is bound to the stored account configuration and administration at startup. If either changes, subsequent tools fail with a restart instruction rather than silently reading another administration.
 
 The CLI and MCP share one multithreaded Tokio runtime and async reqwest clients. MCP requests reuse one connection pool, and independent API reads can overlap. HTTPS callbacks use async tokio-rustls with ring. Session locks cover short state snapshots/updates and token exchanges, never ordinary API reads. Lock contention yields asynchronously; only bounded filesystem operations (including atomic save/fsync) use Tokio's blocking pool.
+
+### Invoice accounting drill-down
+
+Ask "What is on this invoice?", "Show its ledger lines and VAT", or "What was its original transaction-currency amount?" after resolving the company and selecting an outstanding item. The tool reads `PurchaseEntries`/`PurchaseEntryLines` or `SalesEntries`/`SalesEntryLines` using GET only. It requires one uniquely matching header for the account, journal and entry number, then validates every line's entry UUID and administration. Missing or ambiguous headers, wrong-account/administration responses, duplicate line UUIDs and failed source pagination return an error, not partial details. Bank/cash open items may not resolve to an invoice entry; there is no guessed fallback lookup.
+
+Results identify `amount_basis: "exact_accounting_entry"`. `default_currency` is fetched from the selected administration; `entry.currency` is the original transaction currency. Header and line fields ending in `_default_currency` use the former, while those ending in `_transaction_currency` use the latter. Amounts remain decimal strings with source signs unchanged. `line_count` counts every returned entry line across all source pages, ordered by line number and UUID. Ledger codes/descriptions, VAT codes/base amounts, raw VAT percentage, quantities and rate are returned where reported; missing fields remain `null`. Rate, quantity and VAT percentage are source numeric strings, with no server-side rescaling (for example, raw VAT percentage `0.21` is not returned as `21`).
+
+**Accounting signs and VAT are not outstanding-balance semantics.** A normal purchase was observed with a negative header, positive expense line and positive open payable. Do not classify credit notes or payments from header signs. Header and line VAT can differ, including reverse-charge entries where header VAT is zero but line VAT is nonzero. Do not automatically add VAT to header totals, treat line VAT as VAT charged by the supplier, or sum header and lines together. Entry lines are not necessarily product-level invoice lines or a complete balanced ledger transaction dump: the UI can also show automatically generated control/VAT rows absent from the entry-line endpoint. Type, status and reversal are source metadata; retrieval alone does not imply the entry is processed or approved.
+
+These entry amounts are **not remaining balances or proof of payment**; use `get_open_items` for current balances. `document_id`, `document_number` and `document_subject` describe only the header's linked document, not every document related to the transaction. A missing header reference does not prove no related documents exist, and a reference does not prove a PDF is available. No files are downloaded and no Documents permission is needed for this metadata-only scope. Header, default currency and lines are separate reads, not a frozen snapshot.
 
 ### Aging summaries
 
@@ -177,7 +189,9 @@ The administration-wide `get_outstanding_balances` tool was subsequently reconci
 
 Due-date aging was then checked against independent calendar-day calculations from the UI due dates for those 44 rows, including per-account and overall bucket counts and signed balances, overdue/upcoming filters, one-account response pages, and per-account summary-only results. All five known-date aging categories were present in the payable report; receivables occupied current and 1–30 days overdue. Open-item `days_overdue` matched the same due-date calculation. This was not a comparison with the UI's invoice-age column. Exact day-boundary and missing-date/negative-balance cases remain covered by synthetic tests rather than live examples.
 
-This validates the observed current balances, not every financial case. The full visible reports contained 38 payable and six receivable rows, with no negative balances. The queried sample had no nonzero in-transit amounts. **Negative/credit or unmatched-payment rows, known partial payments, nonzero transit, missing due dates, multiple reporting currencies and large multi-page financial reports remain unverified live**; synthetic tests do not close those gaps. Neither the open-items report nor a zero transit amount proves bank settlement. No company identifiers, invoice references or real balances are committed as fixtures.
+Invoice accounting drill-down was read successfully for one purchase and one sales entry, and compared read-only with their Exact booking views. The purchase's signed header and expense/VAT line, ledger/VAT codes and rate, reverse-charge controls and original USD amount were reconciled; its normal-purchase negative header was deliberately preserved. The sales header, seven entry lines, ledger descriptions/codes, net amounts, VAT codes/rates and VAT total matched. The currency contexts were EUR/USD for the purchase and EUR/EUR for the sale. Automatically generated control/VAT transaction rows were not mistaken for entry lines, and no PDFs were accessed. These samples do not validate all invoice types, credit/reversal cases, entry statuses or multi-page invoice-line reports live.
+
+This validates the observed current balances and sampled accounting entries, not every financial case. The full visible reports contained 38 payable and six receivable rows, with no negative balances. The queried sample had no nonzero in-transit amounts. **Negative/credit or unmatched-payment rows, known partial payments, nonzero transit, missing due dates, multiple reporting currencies and large multi-page financial reports remain unverified live**; synthetic tests do not close those gaps. Neither the open-items report nor a zero transit amount proves bank settlement. No company identifiers, invoice references or real balances are committed as fixtures.
 
 To repeat or extend the check:
 
@@ -236,7 +250,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, scoped pagination, account-code/UUID lookup, search windows beyond 50 matches, inclusive due-date/overdue filters, summary totals, administration-wide grouping and account pagination, zero-net accounts, aging boundaries and bucket reconciliation, decimal cancellation/overflow, financial totals, safe errors and administration selection. Subprocess tests exercise MCP initialization, tool discovery, parallel tool calls, company search, open-item queries, structured results, tool errors, scope changes, cancellation during token rotation and clean shutdown on stdin EOF. Additional tests verify overlapping API reads, released query locks, cancelled HTTP requests, single-refresh concurrency and asynchronous lock contention. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
+Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, scoped pagination, account-code/UUID lookup, search windows beyond 50 matches, inclusive due-date/overdue filters, summary totals, administration-wide grouping and account pagination, zero-net accounts, aging boundaries and bucket reconciliation, scoped purchase/sales invoice details, invoice-line pagination, separate currency/sign/VAT semantics, decimal cancellation/overflow, financial totals, safe errors and administration selection. Subprocess tests exercise MCP initialization, tool discovery, parallel tool calls, company search, open-item queries, structured results, tool errors, scope changes, cancellation during token rotation and clean shutdown on stdin EOF. Additional tests verify overlapping API reads, released query locks, cancelled HTTP requests, single-refresh concurrency and asynchronous lock contention. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
 
 ## References
 
@@ -247,4 +261,8 @@ Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with tempo
 - [Exact: administration-wide receivables](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ReadFinancialReceivablesList)
 - [Exact: payables by account](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ReadFinancialPayablesListByAccount)
 - [Exact: receivables by account](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ReadFinancialReceivablesListByAccount)
+- [Exact: purchase accounting entries](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=PurchaseEntryPurchaseEntries)
+- [Exact: purchase accounting lines](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=PurchaseEntryPurchaseEntryLines)
+- [Exact: sales accounting entries](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=SalesEntrySalesEntries)
+- [Exact: sales accounting lines](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=SalesEntrySalesEntryLines)
 - [Picqer Exact client: authorization and refresh behavior](https://github.com/picqer/exact-php-client#authentication)
