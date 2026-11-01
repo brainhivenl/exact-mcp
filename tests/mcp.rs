@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -217,6 +217,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                     | "get_open_items"
                     | "get_outstanding_balances"
                     | "get_invoice_details"
+                    | "get_invoice_matches"
                     | "list_invoice_documents"
                     | "download_invoice_pdf"
             )
@@ -798,6 +799,69 @@ fn stdio_invoice_pdf_download_writes_only_a_private_local_pdf_and_returns_no_byt
     );
     assert!(!response.to_string().contains("fixture-access-token"));
     assert!(!response.to_string().contains("untrusted.invalid"));
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_invoice_matches_return_scoped_allocations_without_claiming_a_payment_audit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let api = thread::spawn(move || {
+        let entry = "44444444-4444-4444-4444-444444444444";
+        let ledger = json!({"ID":"66666666-6666-6666-6666-666666666666","EntryID":entry,"Division":42,"Account":ACCOUNT_ID,
+            "EntryNumber":12345,"FinancialYear":2025,"FinancialPeriod":12,"JournalCode":"70","GLAccountCode":"1200","LineNumber":0,"AmountDC":100});
+        let responses=vec![
+            ("/salesentry/SalesEntries?",json!({"d":[{"EntryID":entry,"Division":42,"EntryNumber":12345,"Journal":"70","Customer":ACCOUNT_ID,"Currency":"USD","AmountDC":100,"AmountFC":120}]}).to_string()),
+            ("/crm/Accounts?",json!({"d":[{"ID":ACCOUNT_ID,"Division":42,"Code":" 00042 "}]}).to_string()),
+            ("/system/Divisions?",json!({"d":[{"Code":42,"Currency":"EUR"}]}).to_string()),
+            ("/financialtransaction/TransactionLines?",json!({"d":[ledger]}).to_string()),
+            ("/docs/XMLDownload.aspx?","<eExact><MatchSets><MatchSet><GLAccount code=\"1200\"/><Account code=\"00042\"/><MatchLines><MatchLine finyear=\"2025\" finperiod=\"12\" journal=\"70\" entry=\"12345\" amountdc=\"100\"/><MatchLine finyear=\"2025\" finperiod=\"12\" journal=\"20\" entry=\"54321\" amountdc=\"-100\"/></MatchLines></MatchSet></MatchSets><Topics><Topic code=\"MatchSets\" ts_d=\"0x0000000000000001\" count=\"1\" pagesize=\"1000\"/></Topics><Messages/></eExact>".into()),
+            ("/financialtransaction/TransactionLines?",json!({"d":[]}).to_string())
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET "));
+            assert!(target.contains(path), "{target}");
+            if path.starts_with("/docs/") {
+                assert!(target.contains("_Division_=42"));
+                assert!(target.contains("Topic=MatchSets"));
+                assert!(!target.contains("DownloadID"));
+            }
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response=process.request(2,"tools/call",json!({"name":"get_invoice_matches","arguments":{"account_id":ACCOUNT_ID,"side":"receivable","entry_number":12345,"journal_code":"70"}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["matching_group_count"], 1);
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["entry"]["currency"], "USD");
+    assert_eq!(
+        result["groups"][0]["members"][1]["allocated_amount_default_currency"],
+        "-100"
+    );
+    assert!(
+        result["ledger_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["resolution"] == "not_found")
+    );
+    assert!(
+        result["interpretation"]
+            .as_str()
+            .unwrap()
+            .contains("not bank settlement")
+    );
+    assert!(!response.to_string().contains("fixture-access-token"));
+    assert!(!directory.join("downloads").exists());
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     api.join().unwrap();

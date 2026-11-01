@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online MCP server with OAuth, explicit administration selection, company search, outstanding-balance and aging reports, invoice accounting details and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
 
 ## Setup
 
@@ -80,7 +80,7 @@ nix run .#pi
 
 This builds the MCP binary, loads credentials from the environment or the repository's `.env`, registers its exact Nix store path as the project-local `exact` server with direct tool exposure, and starts a fresh interactive Pi session. The secret is inherited through the process environment, not saved in the MCP configuration or requested again at a prompt. Existing Pi credentials, models and user-level configuration are reused unchanged.
 
-The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with six tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
+The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with seven tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
 
 ### Other MCP clients
 
@@ -106,6 +106,8 @@ Ensure the MCP host can find `nix` and inherits `EXACT_CLIENT_SECRET` for automa
 - `get_open_items`: `{ "account_id": "<UUID from search_accounts or get_outstanding_balances>", "side": "payable" }`. Use `receivable` for amounts owed by the company. Returns all pages of current open items with invoice/entry references, due dates, descriptions and per-currency totals. Optional `due_date_from` and `due_date_to` are inclusive `YYYY-MM-DD` due-date bounds; `overdue_only: true` selects items due before the local `as_of_date`. These filters intersect, and any active due-date/overdue filter excludes items without a due date. Set `summary_only: true` to omit the `items` field while retaining complete matching totals.
 
 - `get_invoice_details`: `{ "account_id": "<UUID>", "side": "payable", "entry_number": 12345, "journal_code": "60" }`. Use the account UUID, side, entry number and journal code from the **same** `get_open_items` result; the example numbers are placeholders, not values to guess. Returns a purchase (`payable`) or sales (`receivable`) accounting header, all entry lines, both currency contexts and the header's linked-document reference. It does not download documents or determine current open balances.
+
+- `get_invoice_matches`: the same `{ "account_id", "side", "entry_number", "journal_code" }` inputs as `get_invoice_details`, using verified references (including closed invoices). Returns recorded matching groups with signed default-currency allocations and counterpart ledger evidence. Requires XML `MatchSets` download access plus **Crm accounts**, **Financial accounting** and **Organization administration**. This is not a match/unmatch event audit, current open balance, or proof of bank settlement.
 
 - `list_invoice_documents`: the same `{ "account_id", "side", "entry_number", "journal_code" }` inputs as `get_invoice_details`. Returns linked document types/subjects, association provenance, attachment IDs and filename-only PDF hints without downloading bytes. `invoice_type_match` is true for Exact purchase document type 20 or sales type 10; reminders and other types remain distinguishable and cannot be downloaded as invoices.
 - `download_invoice_pdf`: `{ "invoice": { "account_id": "<UUID>", "side": "payable", "entry_number": 12345, "journal_code": "60" }, "document_id": "<UUID from catalog>", "attachment_id": "<UUID from that document>" }`. Revalidates the selected invoice/document/attachment, downloads one existing PDF and returns its private local path. Never guess IDs or silently pick the first of multiple eligible originals/PDFs.
@@ -187,6 +189,22 @@ Open-item rows also include `days_overdue`: zero for due today/future, positive 
 - "Give me an aging breakdown of our outstanding receivables."
 - "Which customers have amounts more than 90 days overdue?"
 - "Show the aging of what we owe this supplier, without listing invoices."
+
+### Recorded invoice matching
+
+`get_invoice_matches` verifies the invoice accounting identity, account code and ledger references before reading Exact's authenticated XML `MatchSets` export. The complete selected-administration export is read in memory, then filtered to this account and invoice; unrelated sets and raw exports are not returned or saved. It can therefore require more reads than an invoice-details lookup. No financial writes or server-side incremental-export checkpoints are used.
+
+Each group includes all source members, identified by account/G/L context and financial year, period, journal and entry number. `allocated_amount_default_currency` is the signed `amountdc` reported by XML and uses `default_currency`, not necessarily the invoice or cashflow transaction currency. Related invoice/credit/cashflow entries can share a group. Multi-invoice/payment groups do **not** supply pairwise apportionment; do not assign each payment to an individual invoice or sum full posting amounts as allocations. No paid/remaining aggregate is inferred.
+
+`ledger_evidence` resolves each member reference against scoped REST transaction lines. `unique_ledger_line`, `ambiguous_ledger_lines` and `not_found` distinguish the outcomes. All ambiguous candidates remain visible, even when one amount happens to match the allocation. Names, descriptions and references are untrusted. Source type codes are preserved; negative amounts alone do not identify credits/payments. `posting_date` is an accounting date, **not** a matching, bank value or clearing date. Recorded accounting matching does not prove bank settlement; no groups found is not proof of nonpayment.
+
+The source supplies no immutable match-set IDs or match-event timestamps. `export_page` and `set_index_on_page` are response-local diagnostics, not stable IDs. This traces currently recorded allocations for past/current entries, not an audit of matching, unmatching or rematching. Export/ledger reads are not transactionally frozen; source changes during paging can move groups. Identical groups/members are retained because the export supplies no IDs for safe deduplication.
+
+Exact's [XML code examples](https://support.exactonline.com/community/s/knowledge-base#All-All-DNO-Content-xmlsamplecode) specify mandatory `_Division_` scoping and `TSPaging=<previous Topic ts_d>` continuation. The reader follows every page to a non-full page or the provider's empty terminal envelope, validates counts/cursors/schema and rejects source messages, DTDs, malformed XML and unbalanced groups. Limits are 2 MiB per page, 64 MiB per export, 128 pages and 256 distinct matching ledger references; failures return no partial matching. Redirects are never followed. `Params_DownloadID` is deliberately not used because it changes an incremental-export checkpoint.
+
+Live validation covered closed purchase/sales invoices, continuation beyond the initial page, terminal-empty behavior, account/ledger identities and independent agreement with a receipt shown in Exact's UI. Partial, credit, multi-member and ambiguous-line regressions use invented fixtures, not real financial data. REST status 50/zero amounts and `OffsetID` are not used as allocation links: a sampled bank `OffsetID` pointed to its own contra line, not to the invoice. Private probe evidence remains outside the repository.
+
+Exact's [January 2027 XML deprecation notice](https://support.exactonline.com/community/s/knowledge-base#All-All-DNO-Content-breaking-changes-2707-bc-xmlswitchrestapi) lists selected topics only; `MatchSets` is not listed. Monitor future notices rather than assuming every XML topic has a REST equivalent.
 
 ### Financial interpretation
 

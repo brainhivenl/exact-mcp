@@ -3244,3 +3244,503 @@ async fn missing_original_invoice_pdfs_are_not_generated_or_guessed() {
             .all(|request| request.target.starts_with("GET "))
     );
 }
+
+fn matching_ledger(entry: i64, journal: &str, id: &str) -> Value {
+    json!({"ID":id,"EntryID":if entry==12345 {INVOICE_ENTRY_ID} else {"99999999-9999-9999-9999-999999999999"},
+        "Division":42,"Account":COMPANY_ID,"EntryNumber":entry,"FinancialYear":2025,"FinancialPeriod":12,
+        "JournalCode":journal,"GLAccountCode":" 01200 ","LineNumber":0,"Type":if journal=="20" {40} else {20},
+        "Date":"2025-12-20","AmountDC":42.125,"AmountFC":51.25,"Currency":"USD","InvoiceNumber":12345})
+}
+
+fn matching_member(entry: i64, journal: &str, amount: &str) -> String {
+    format!(
+        "<MatchLine finyear=\"2025\" finperiod=\"12\" journal=\"{journal}\" entry=\"{entry}\" amountdc=\"{amount}\"/>"
+    )
+}
+
+fn matching_set(code: &str, members: &str) -> String {
+    format!(
+        "<MatchSet><GLAccount code=\"01200\"/><Account code=\"{code}\"/><MatchLines>{members}</MatchLines></MatchSet>"
+    )
+}
+
+fn matching_page(sets: &str, count: usize, size: usize, cursor: &str) -> Response {
+    Response {
+        status: "200 OK",
+        location: None,
+        body: format!(
+            "<eExact><MatchSets>{sets}</MatchSets><Topics><Topic code=\"MatchSets\" ts_d=\"{cursor}\" count=\"{count}\" pagesize=\"{size}\"/></Topics><Messages/></eExact>"
+        ),
+    }
+}
+
+fn matching_setup() -> Vec<Response> {
+    let mut header = invoice_header("receivable");
+    header["AmountDC"] = json!(42.125);
+    vec![
+        Response::json(json!({"d":[header]})),
+        Response::json(json!({"d":[{"ID":COMPANY_ID,"Division":42,"Code":" 00042 "}]})),
+        division_currency_response(),
+        Response::json(json!({"d":[matching_ledger(12345,"70",INVOICE_LINE_ID)]})),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_matches_read_every_xml_page_filter_codes_exactly_and_keep_ambiguous_ledger_lines()
+{
+    let pair = format!(
+        "{}{}",
+        matching_member(12345, "70", "42.125"),
+        matching_member(54321, "20", "-42.125")
+    );
+    let mut responses = matching_setup();
+    responses.push(matching_page(
+        &matching_set("000042", &pair),
+        1,
+        1,
+        "0x0000000000000001",
+    ));
+    responses.push(matching_page(
+        &matching_set("00042", &pair),
+        1,
+        1,
+        "0x0000000000000002",
+    ));
+    responses.push(Response {
+        status: "200 OK",
+        location: None,
+        body: "<eExact><Messages/></eExact>".into(),
+    });
+    let first = matching_ledger(54321, "20", "77777777-7777-7777-7777-777777777777");
+    let mut second = first.clone();
+    second["ID"] = json!("88888888-8888-8888-8888-888888888888");
+    second["LineNumber"] = json!(2);
+    second["AmountDC"] = json!(-42.125);
+    responses.push(Response::json(
+        json!({"d":{"results":[first],"__next":"?page=2"}}),
+    ));
+    responses.push(Response::json(json!({"d":[second]})));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = serde_json::to_value(
+        backend
+            .get_invoice_matches(invoice_args("receivable"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["export_pages_read"], 3);
+    assert_eq!(result["matching_group_count"], 1);
+    assert_eq!(result["account_code"], "00042");
+    assert_eq!(result["groups"][0]["export_page"], 2);
+    assert_eq!(
+        result["groups"][0]["members"][0]["allocated_amount_default_currency"],
+        "42.125"
+    );
+    assert_eq!(
+        result["groups"][0]["members"][1]["allocated_amount_default_currency"],
+        "-42.125"
+    );
+    assert_eq!(result["groups"][0]["members"][0]["is_target_invoice"], true);
+    let evidence = result["ledger_evidence"].as_array().unwrap();
+    let bank = evidence
+        .iter()
+        .find(|x| x["reference"]["journal_code"] == "20")
+        .unwrap();
+    assert_eq!(bank["resolution"], "ambiguous_ledger_lines");
+    assert_eq!(bank["candidates"].as_array().unwrap().len(), 2);
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["entry"]["currency"], "USD");
+    assert!(
+        result["interpretation"]
+            .as_str()
+            .unwrap()
+            .contains("not bank settlement")
+    );
+    let base = server.base.clone();
+    let requests = server.finish();
+    assert_eq!(requests.len(), 9);
+    for (index, request) in requests.iter().enumerate().take(7).skip(4) {
+        let url = base
+            .join(request.target.split_whitespace().nth(1).unwrap())
+            .unwrap();
+        assert_eq!(url.path(), "/docs/XMLDownload.aspx");
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(params["_Division_"], "42");
+        assert_eq!(params["Topic"], "MatchSets");
+        assert!(!params.contains_key("Params_DownloadID"));
+        assert_eq!(params.len(), if index == 4 { 2 } else { 3 });
+        if index > 4 {
+            assert_eq!(params["TSPaging"], format!("0x{:016X}", index - 4));
+        }
+        assert_eq!(request.headers["authorization"], "Bearer old-access");
+    }
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.target.starts_with("GET ") && r.body.is_empty())
+    );
+    assert!(!result.to_string().contains("000042"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_matches_preserve_partial_and_credit_group_members_without_pairwise_apportionment()
+{
+    let first = format!(
+        "{}{}{}",
+        matching_member(12345, "70", "25.125"),
+        matching_member(54321, "20", "-20"),
+        matching_member(54322, "70", "-5.125")
+    );
+    let second = format!(
+        "{}{}",
+        matching_member(12345, "70", "17"),
+        matching_member(54321, "20", "-17")
+    );
+    let mut responses = matching_setup();
+    responses.push(matching_page(
+        &format!(
+            "{}{}",
+            matching_set("00042", &first),
+            matching_set("00042", &second)
+        ),
+        2,
+        1000,
+        "0x0000000000000003",
+    ));
+    let mut bank = matching_ledger(54321, "20", "77777777-7777-7777-7777-777777777777");
+    bank["AmountDC"] = json!(-1000);
+    responses.push(Response::json(json!({"d":[bank]})));
+    let mut credit = matching_ledger(54322, "70", "88888888-8888-8888-8888-888888888888");
+    credit["Type"] = json!(21);
+    credit["AmountDC"] = json!(-5.125);
+    responses.push(Response::json(json!({"d":[credit]})));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = serde_json::to_value(
+        backend
+            .get_invoice_matches(invoice_args("receivable"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["matching_group_count"], 2);
+    assert_eq!(result["groups"][0]["members"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        result["groups"][0]["members"][0]["allocated_amount_default_currency"],
+        "25.125"
+    );
+    assert_eq!(
+        result["groups"][1]["members"][0]["allocated_amount_default_currency"],
+        "17"
+    );
+    assert_eq!(result["ledger_evidence"].as_array().unwrap().len(), 3);
+    assert!(result.get("remaining_amount").is_none());
+    assert!(result.get("paid_amount").is_none());
+    assert!(
+        result["interpretation"]
+            .as_str()
+            .unwrap()
+            .contains("not an apportioned invoice-to-payment edge")
+    );
+    assert_eq!(server.finish().len(), 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_matches_no_groups_or_missing_peer_rows_do_not_imply_settlement_status() {
+    for missing in [false, true] {
+        let mut responses = matching_setup();
+        let pair = matching_set(
+            "00042",
+            &format!(
+                "{}{}",
+                matching_member(12345, "70", "42.125"),
+                matching_member(54321, "20", "-42.125")
+            ),
+        );
+        responses.push(matching_page(
+            if missing { &pair } else { "" },
+            usize::from(missing),
+            1000,
+            "0x0000000000000001",
+        ));
+        if missing {
+            responses.push(Response::json(json!({"d":[]})));
+        }
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let result = serde_json::to_value(
+            backend
+                .get_invoice_matches(invoice_args("receivable"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        if missing {
+            assert!(
+                result["ledger_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["resolution"] == "not_found")
+            );
+        } else {
+            assert_eq!(result["matching_group_count"], 0);
+            assert_eq!(result["ledger_evidence"], json!([]));
+        }
+        assert!(
+            result["interpretation"]
+                .as_str()
+                .unwrap()
+                .contains("not proof of nonpayment")
+        );
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_matches_reject_cursor_cycles_inconsistent_pages_source_errors_and_redirects() {
+    let pair = matching_set(
+        "00042",
+        &format!(
+            "{}{}",
+            matching_member(12345, "70", "42.125"),
+            matching_member(54321, "20", "-42.125")
+        ),
+    );
+    for next in [
+        matching_page(&pair, 1, 1, "0x0000000000000001"),
+        matching_page(&pair, 1, 2, "0x0000000000000002"),
+        matching_page(&pair, 2, 1, "0x0000000000000002"),
+        Response {
+            status: "403 Forbidden",
+            body: "PRIVATE_FINANCIAL_TEXT".into(),
+            location: None,
+        },
+        Response {
+            status: "429 Too Many Requests",
+            body: "PRIVATE_FINANCIAL_TEXT".into(),
+            location: None,
+        },
+        Response {
+            status: "302 Found",
+            body: "PRIVATE_FINANCIAL_TEXT".into(),
+            location: Some("https://untrusted.invalid/".into()),
+        },
+    ] {
+        let mut responses = matching_setup();
+        responses.push(matching_page(&pair, 1, 1, "0x0000000000000001"));
+        responses.push(next);
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let error = backend
+            .get_invoice_matches(invoice_args("receivable"))
+            .await
+            .err()
+            .unwrap();
+        assert!(!format!("{error:#}").contains("PRIVATE_FINANCIAL_TEXT"));
+        assert_eq!(server.finish().len(), 6);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_matches_reject_wrong_identity_and_wrong_or_duplicate_ledger_rows() {
+    let pair = matching_set(
+        "00042",
+        &format!(
+            "{}{}",
+            matching_member(12345, "70", "42.125"),
+            matching_member(54321, "20", "-42.125")
+        ),
+    );
+    for field in [
+        "Division",
+        "Account",
+        "FinancialYear",
+        "FinancialPeriod",
+        "JournalCode",
+        "EntryNumber",
+        "ID",
+    ] {
+        let mut row = matching_ledger(54321, "20", "77777777-7777-7777-7777-777777777777");
+        row[field] = match field {
+            "Division" => json!(43),
+            "Account" => json!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            "FinancialYear" => json!(2024),
+            "FinancialPeriod" => json!(11),
+            "JournalCode" => json!("30"),
+            "EntryNumber" => json!(54322),
+            _ => json!(uuid::Uuid::nil().to_string()),
+        };
+        let mut responses = matching_setup();
+        responses.push(matching_page(&pair, 1, 1000, "0x0000000000000001"));
+        responses.push(Response::json(json!({"d":[row]})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .get_invoice_matches(invoice_args("receivable"))
+                .await
+                .is_err()
+        );
+        server.finish();
+    }
+    let row = matching_ledger(54321, "20", "77777777-7777-7777-7777-777777777777");
+    let mut responses = matching_setup();
+    responses.push(matching_page(&pair, 1, 1000, "0x0000000000000001"));
+    responses.push(Response::json(json!({"d":[row.clone(),row]})));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    assert!(
+        backend
+            .get_invoice_matches(invoice_args("receivable"))
+            .await
+            .is_err()
+    );
+    server.finish();
+    for account in [
+        json!([]),
+        json!([{"ID":COMPANY_ID,"Division":43,"Code":"00042"}]),
+        json!([{"ID":COMPANY_ID,"Division":42,"Code":" "}]),
+    ] {
+        let mut responses = matching_setup();
+        responses.truncate(2);
+        responses[1] = Response::json(json!({"d":account}));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .get_invoice_matches(invoice_args("receivable"))
+                .await
+                .is_err()
+        );
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_matching_limits_never_return_partial_groups_or_unbounded_ledger_evidence() {
+    let pair = matching_set(
+        "00042",
+        &format!(
+            "{}{}",
+            matching_member(12345, "70", "42.125"),
+            matching_member(54321, "20", "-42.125")
+        ),
+    );
+    let mut responses = matching_setup();
+    for cursor in 1..=128 {
+        responses.push(matching_page(&pair, 1, 1, &format!("0x{cursor:016X}")));
+    }
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let error = backend
+        .get_invoice_matches(invoice_args("receivable"))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("page limit"));
+    assert_eq!(server.finish().len(), 132);
+    let mut members = matching_member(12345, "70", "256");
+    for entry in 1000..1256 {
+        members.push_str(&matching_member(entry, "20", "-1"));
+    }
+    let mut responses = matching_setup();
+    responses.push(matching_page(
+        &matching_set("00042", &members),
+        1,
+        1000,
+        "0x0000000000000001",
+    ));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let error = backend
+        .get_invoice_matches(invoice_args("receivable"))
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("evidence limit"));
+    assert_eq!(server.finish().len(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matching_xml_requests_reject_wrong_administration_cursors_and_changed_scope_before_io() {
+    let server = Server::new(vec![]);
+    let (directory, _backend) = financial_backend(&server.base).await;
+    let mut client = exact::ExactClient::new(
+        directory.path().to_owned(),
+        oauth::http_client().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    client.pin_administration().unwrap();
+    assert!(client.get_match_sets_page(43, None, 32).await.is_err());
+    assert!(
+        client
+            .get_match_sets_page(42, Some("0x0000000000000001&Topic=Accounts"), 32)
+            .await
+            .is_err()
+    );
+    let store = Store::open(directory.path()).await.unwrap();
+    let mut changed = store.require_session().await.unwrap();
+    changed.administration.as_mut().unwrap().code = 43;
+    store.save(&changed).await.unwrap();
+    drop(store);
+    assert!(client.get_match_sets_page(42, None, 32).await.is_err());
+    assert_eq!(server.finish().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matching_xml_body_size_is_bounded_and_rejects_oversize_before_parsing() {
+    let server = Server::new(vec![Response {
+        status: "200 OK",
+        location: None,
+        body: "x".repeat(64),
+    }]);
+    let (directory, _backend) = financial_backend(&server.base).await;
+    let mut client = exact::ExactClient::new(
+        directory.path().to_owned(),
+        oauth::http_client().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    client.pin_administration().unwrap();
+    assert!(
+        client
+            .get_match_sets_page(42, None, 32)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("size limit")
+    );
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_matches_reject_reused_ledger_ids_across_invoice_and_counterpart() {
+    let pair = matching_set(
+        "00042",
+        &format!(
+            "{}{}",
+            matching_member(12345, "70", "42.125"),
+            matching_member(54321, "20", "-42.125")
+        ),
+    );
+    let mut responses = matching_setup();
+    responses.push(matching_page(&pair, 1, 1000, "0x0000000000000001"));
+    responses.push(Response::json(
+        json!({"d":[matching_ledger(54321,"20",INVOICE_LINE_ID)]}),
+    ));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    assert!(
+        backend
+            .get_invoice_matches(invoice_args("receivable"))
+            .await
+            .is_err()
+    );
+    server.finish();
+}

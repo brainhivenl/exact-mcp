@@ -212,6 +212,73 @@ impl ExactClient {
         Ok(body)
     }
 
+    pub(crate) async fn get_match_sets_page(
+        &self,
+        division: u32,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            self.pinned_administration == Some(division),
+            "Matching administration must match the selected administration"
+        );
+        if let Some(cursor) = cursor {
+            ensure!(
+                crate::matching::valid_cursor(cursor),
+                "Invalid matching export cursor"
+            );
+        }
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let mut url = self.base_url.join("/docs/XMLDownload.aspx")?;
+        url.query_pairs_mut()
+            .append_pair("Topic", "MatchSets")
+            .append_pair("_Division_", &division.to_string());
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("TSPaging", cursor);
+        }
+        let token = self.access_token().await?;
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let mut response = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/xml")
+            .send()
+            .await
+            .context("Exact matching export request failed")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("Exact rejected authorization; run `exact-mcp auth login` again");
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            bail!("Exact API rate limit reached (HTTP 429); wait before trying again");
+        }
+        ensure!(
+            status.is_success(),
+            "Exact matching export request failed (HTTP {status})"
+        );
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= limit as u64),
+            "Exact matching export exceeds the size limit; no partial matching returned"
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Cannot read Exact matching export")?
+        {
+            ensure!(
+                body.len().saturating_add(chunk.len()) <= limit,
+                "Exact matching export exceeds the size limit; no partial matching returned"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        self.session().await?;
+        Ok(body)
+    }
+
     pub async fn save_invoice_pdf(
         &self,
         division: u32,

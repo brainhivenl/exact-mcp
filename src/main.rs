@@ -1,6 +1,7 @@
 mod exact;
 mod financial;
 mod invoice;
+mod matching;
 mod mcp;
 mod oauth;
 mod pdf;

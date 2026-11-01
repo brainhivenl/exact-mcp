@@ -22,11 +22,11 @@ pub struct GetInvoiceDetails {
     )]
     pub side: Side,
     #[schemars(
-        description = "entry_number from get_open_items, NOT the supplier reference or a guessed invoice number."
+        description = "Verified Exact accounting entry number, e.g. entry_number from get_open_items. Known closed entries are allowed. NOT a supplier reference or guessed invoice number."
     )]
     pub entry_number: i64,
     #[schemars(
-        description = "journal_code from the same get_open_items row. Bank/cash entries are not purchase/sales invoice entries."
+        description = "Verified journal_code for the same accounting entry, e.g. from get_open_items. Bank/cash entries are not purchase/sales invoice entries."
     )]
     pub journal_code: String,
 }
@@ -213,22 +213,7 @@ pub(crate) async fn get_details(
         Side::Payable => "purchaseentry/PurchaseEntryLines",
         Side::Receivable => "salesentry/SalesEntryLines",
     };
-    let mut division_url = root.join("system/Divisions")?;
-    division_url
-        .query_pairs_mut()
-        .append_pair("$select", "Code,Currency")
-        .append_pair("$filter", &format!("Code eq {}", administration.code));
-    let divisions: Vec<DivisionCurrency> = client.get_collection(division_url).await
-        .context("Cannot resolve the administration's default currency; check Organization administration permission")?;
-    ensure!(
-        divisions.len() == 1 && divisions[0].code == administration.code,
-        "Exact did not return the selected administration's currency; no details returned"
-    );
-    let default_currency = divisions[0].currency.trim().to_owned();
-    ensure!(
-        !default_currency.is_empty(),
-        "Exact returned no default currency; no details returned"
-    );
+    let default_currency = default_currency(client, administration).await?;
 
     let mut lines_url = root.join(lines_resource)?;
     lines_url
@@ -274,4 +259,31 @@ fn number_string<S: Serializer>(
         .as_ref()
         .map(ToString::to_string)
         .serialize(serializer)
+}
+
+pub(crate) async fn default_currency(
+    client: &ExactClient,
+    administration: &Administration,
+) -> Result<String> {
+    let root = client
+        .base_url()
+        .join(&format!("/api/v1/{}/", administration.code))?;
+    let mut division_url = root.join("system/Divisions")?;
+    division_url
+        .query_pairs_mut()
+        .append_pair("$select", "Code,Currency")
+        .append_pair("$filter", &format!("Code eq {}", administration.code));
+    let divisions: Vec<DivisionCurrency> = client.get_collection(division_url).await
+        .context("Cannot resolve the administration's default currency; check Organization administration permission")?;
+    ensure!(
+        divisions.len() == 1 && divisions[0].code == administration.code,
+        "Exact did not return the selected administration's currency; no details returned"
+    );
+    let default_currency = divisions[0].currency.trim().to_owned();
+    ensure!(
+        !default_currency.is_empty(),
+        "Exact returned no default currency; no details returned"
+    );
+
+    Ok(default_currency)
 }

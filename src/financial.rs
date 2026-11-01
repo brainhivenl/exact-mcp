@@ -387,6 +387,13 @@ impl Backend {
         crate::pdf::download_pdf(&self.client, &self.administration, args).await
     }
 
+    pub async fn get_invoice_matches(
+        &self,
+        args: crate::invoice::GetInvoiceDetails,
+    ) -> Result<crate::matching::InvoiceMatchesResult> {
+        crate::matching::get_matches(&self.client, &self.administration, args).await
+    }
+
     pub async fn get_invoice_details(
         &self,
         args: crate::invoice::GetInvoiceDetails,
@@ -674,7 +681,22 @@ impl Backend {
 pub(crate) struct Money(Decimal);
 
 impl Money {
-    fn add(&mut self, other: Self) -> Result<()> {
+    pub(crate) fn from_xml(value: &str) -> Result<Self> {
+        let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+        ensure!(
+            unsigned.bytes().any(|byte| byte.is_ascii_digit())
+                && unsigned
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                && unsigned.bytes().filter(|byte| *byte == b'.').count() <= 1,
+            "Invalid XML decimal amount"
+        );
+        Decimal::from_str_exact(value)
+            .map(Self)
+            .map_err(|_| anyhow::anyhow!("Invalid or out-of-range XML financial amount"))
+    }
+
+    pub(crate) fn add(&mut self, other: Self) -> Result<()> {
         let sum = self
             .0
             .checked_add(other.0)
