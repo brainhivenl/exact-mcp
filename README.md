@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online MCP server with OAuth, explicit administration selection, company search, administration-wide outstanding balances and per-company payables/receivables. Financial operations are read-only; no invoice creation or payment tools are exposed.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company search, administration-wide outstanding balances, due-date aging summaries and per-company payables/receivables. Financial operations are read-only; no invoice creation or payment tools are exposed.
 
 ## Setup
 
@@ -126,7 +126,7 @@ Open-item results echo `filters`, `summary_only`, `source_item_count` (before fi
 
 This answers "Who owes us overdue money?"; use `side: "payable"` for "Who do we need to pay?". Due-date bounds can select upcoming balances, such as payments due this month.
 
-The `accounts` array contains `{ "account": { "id", "code", "name" }, "totals_by_currency": { ... } }` summaries. Each currency total includes item counts, signed net/positive/negative balances, signed overdue balance, separate known transit and unknown-date/transit counts. Accounts with matching rows remain visible even when their signed net balance is zero. These summaries do not invent supplier/customer flags or classify negative rows.
+The `accounts` array contains `{ "account": { "id", "code", "name" }, "totals_by_currency": { ... } }` summaries. Each currency total includes item counts, signed net/positive/negative balances, signed overdue balance, due-date aging buckets, separate known transit and unknown-date/transit counts. Accounts with matching rows remain visible even when their signed net balance is zero. These summaries do not invent supplier/customer flags or classify negative rows.
 
 Account summaries are ordered by name, code and UUID. `limit` is 1–50 (default 50); repeat the same side, filters and limit with `offset: next_offset` while `has_more` is true. **Overall `totals_by_currency` includes every matching account across all source pages, not just the summaries returned on the current page.** Per-account totals include that account's matching rows. `source_item_count`/`source_account_count` describe the complete source report before filtering; `matched_item_count`/`matched_account_count` describe the complete filtered report before response pagination. A page beyond the end has no account summaries but retains complete matching totals and counts.
 
@@ -135,6 +135,29 @@ Each call fetches the full source report before filtering, grouping and paginati
 The server is bound to the stored account configuration and administration at startup. If either changes, subsequent tools fail with a restart instruction rather than silently reading another administration.
 
 The CLI and MCP share one multithreaded Tokio runtime and async reqwest clients. MCP requests reuse one connection pool, and independent API reads can overlap. HTTPS callbacks use async tokio-rustls with ring. Session locks cover short state snapshots/updates and token exchanges, never ordinary API reads. Lock contention yields asynchronously; only bounded filesystem operations (including atomic save/fsync) use Tokio's blocking pool.
+
+### Aging summaries
+
+Both financial tools include `aging_by_due_date` inside every currency total, including each administration-wide account summary and summary-only open-item results. This is computed from existing report rows with no extra API requests. It uses **calendar days past the due date**, relative to the response's local `as_of_date`, not the invoice date or the UI's invoice-age **Ouderdom: Dagen** column.
+
+| Bucket | Due-date rule |
+| --- | --- |
+| `current` | Due today or later |
+| `overdue_1_30_days` | 1–30 days overdue, inclusive |
+| `overdue_31_60_days` | 31–60 days overdue, inclusive |
+| `overdue_61_90_days` | 61–90 days overdue, inclusive |
+| `overdue_over_90_days` | Strictly more than 90 days overdue |
+| `unknown_due_date` | No known due date; never treated as current or overdue |
+
+Only buckets containing matching items are returned; a missing bucket means no matching rows, not an unknown balance. Each bucket contains `item_count`, `net_open_amount`, `positive_open_amount` and `negative_open_amount`, all using the same report currency as its parent total. Counts and signed balances reconcile to the parent total across all buckets. Zero-net buckets remain present when they contain rows; negative amounts are not automatically classified as credit notes or payments. Transit is not subtracted from aging amounts.
+
+Filters apply before aging. Active due-date or overdue filters exclude unknown-date rows. Overall aging covers all matching accounts across all source pages, not just the account summaries on the current response page. Per-account aging covers that account's matching rows. Accounts remain name/code/UUID ordered, not ranked by debt or risk; retrieve all relevant pages before claiming a largest balance. Use a smaller account `limit` for compact detailed aging responses.
+
+Open-item rows also include `days_overdue`: zero for due today/future, positive calendar days for overdue rows, and `null` for unknown dates. No historical snapshot or original-currency conversion is implied. Example questions:
+
+- "Give me an aging breakdown of our outstanding receivables."
+- "Which customers have amounts more than 90 days overdue?"
+- "Show the aging of what we owe this supplier, without listing invoices."
 
 ### Financial interpretation
 
@@ -151,6 +174,8 @@ The CLI and MCP share one multithreaded Tokio runtime and async reqwest clients.
 On 2026-11-01, 24 current open items across five suppliers and four customers were reconciled read-only against Exact's **Openstaande posten: Te betalen** and **Te vorderen** reports in the same administration. Invoice/entry references, invoice dates, due dates, descriptions, open report balances, row counts and net totals matched. Overdue and inclusive due-date filters, plus summary-only totals, matched subsets of those UI rows. A USD-invoiced supplier confirmed that the API returns EUR reporting balances for those items. An unpadded numeric account-code lookup was verified after changing the filter to `trim(Code)`.
 
 The administration-wide `get_outstanding_balances` tool was subsequently reconciled against all 38 payable rows grouped into 20 suppliers and all six receivable rows grouped into four customers. Per-account and overall report balances matched, including overdue subsets (28 payable and five receivable rows) and November due-date subsets (ten payable and one receivable row). Limiting responses to one account retained complete overall totals on both sides. Raw financial evidence remains private, outside the repository.
+
+Due-date aging was then checked against independent calendar-day calculations from the UI due dates for those 44 rows, including per-account and overall bucket counts and signed balances, overdue/upcoming filters, one-account response pages, and per-account summary-only results. All five known-date aging categories were present in the payable report; receivables occupied current and 1–30 days overdue. Open-item `days_overdue` matched the same due-date calculation. This was not a comparison with the UI's invoice-age column. Exact day-boundary and missing-date/negative-balance cases remain covered by synthetic tests rather than live examples.
 
 This validates the observed current balances, not every financial case. The full visible reports contained 38 payable and six receivable rows, with no negative balances. The queried sample had no nonzero in-transit amounts. **Negative/credit or unmatched-payment rows, known partial payments, nonzero transit, missing due dates, multiple reporting currencies and large multi-page financial reports remain unverified live**; synthetic tests do not close those gaps. Neither the open-items report nor a zero transit amount proves bank settlement. No company identifiers, invoice references or real balances are committed as fixtures.
 
@@ -211,7 +236,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, scoped pagination, account-code/UUID lookup, search windows beyond 50 matches, inclusive due-date/overdue filters, summary totals, administration-wide grouping and account pagination, zero-net accounts, decimal cancellation/overflow, financial totals, safe errors and administration selection. Subprocess tests exercise MCP initialization, tool discovery, parallel tool calls, company search, open-item queries, structured results, tool errors, scope changes, cancellation during token rotation and clean shutdown on stdin EOF. Additional tests verify overlapping API reads, released query locks, cancelled HTTP requests, single-refresh concurrency and asynchronous lock contention. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
+Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with temporary certificates. They cover state validation, automatic self-signed TLS, optional certificate/key loading, callback handling, token exchange/rotation, serialized refresh, storage permissions, scoped pagination, account-code/UUID lookup, search windows beyond 50 matches, inclusive due-date/overdue filters, summary totals, administration-wide grouping and account pagination, zero-net accounts, aging boundaries and bucket reconciliation, decimal cancellation/overflow, financial totals, safe errors and administration selection. Subprocess tests exercise MCP initialization, tool discovery, parallel tool calls, company search, open-item queries, structured results, tool errors, scope changes, cancellation during token rotation and clean shutdown on stdin EOF. Additional tests verify overlapping API reads, released query locks, cancelled HTTP requests, single-refresh concurrency and asynchronous lock contention. Test certificates are trusted only by the test client; no CA is installed into the OS trust store. Live Exact OAuth, app permissions and administration access still require testing with your own application/account.
 
 ## References
 

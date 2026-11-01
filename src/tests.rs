@@ -1020,6 +1020,29 @@ async fn outstanding_items_sum_decimal_amounts_and_keep_currencies_and_transit_s
     assert_eq!(result["items"][0]["your_ref"], "SUPPLIER-001");
     assert_eq!(result["items"][1]["overdue"], false);
     assert_eq!(result["items"][2]["overdue"], Value::Null);
+    assert_eq!(result["items"][1]["days_overdue"], 0);
+    assert_eq!(result["items"][2]["days_overdue"], Value::Null);
+    let today =
+        chrono::NaiveDate::parse_from_str(result["as_of_date"].as_str().unwrap(), "%Y-%m-%d")
+            .unwrap();
+    assert_eq!(
+        result["items"][0]["days_overdue"],
+        today
+            .signed_duration_since(chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap())
+            .num_days()
+    );
+    assert_eq!(
+        euros["aging_by_due_date"]["current"]["net_open_amount"],
+        "0.2"
+    );
+    assert_eq!(
+        euros["aging_by_due_date"]["overdue_over_90_days"]["net_open_amount"],
+        "0.1"
+    );
+    assert_eq!(
+        euros["aging_by_due_date"]["unknown_due_date"]["negative_open_amount"],
+        "-0.1"
+    );
     assert_eq!(result["side"], "payable");
     assert_eq!(result["amount_basis"], "exact_report_currency");
     assert!(result["retrieved_at"].as_str().is_some());
@@ -1670,6 +1693,46 @@ async fn outstanding_item_date_filters_and_summaries_cover_all_matching_pages() 
             assert_eq!(result["source_item_count"], 6);
             assert_eq!(result["matched_item_count"], count);
             assert_eq!(result["summary_only"], summary_only);
+            for totals in result["totals_by_currency"].as_object().unwrap().values() {
+                let aging = totals["aging_by_due_date"].as_object().unwrap();
+                assert_eq!(
+                    aging
+                        .values()
+                        .map(|bucket| bucket["item_count"].as_u64().unwrap())
+                        .sum::<u64>(),
+                    totals["item_count"].as_u64().unwrap()
+                );
+                for field in [
+                    "net_open_amount",
+                    "positive_open_amount",
+                    "negative_open_amount",
+                ] {
+                    let sum: rust_decimal::Decimal = aging
+                        .values()
+                        .map(|bucket| {
+                            bucket[field]
+                                .as_str()
+                                .unwrap()
+                                .parse::<rust_decimal::Decimal>()
+                                .unwrap()
+                        })
+                        .sum();
+                    assert_eq!(
+                        sum,
+                        totals[field]
+                            .as_str()
+                            .unwrap()
+                            .parse::<rust_decimal::Decimal>()
+                            .unwrap()
+                    );
+                }
+                if filters.get("overdue_only") == Some(&json!(true))
+                    || filters.get("due_date_from").is_some()
+                    || filters.get("due_date_to").is_some()
+                {
+                    assert!(!aging.contains_key("unknown_due_date"));
+                }
+            }
             assert_eq!(result["filters"]["due_date_from"], filters["due_date_from"]);
             assert_eq!(result["filters"]["due_date_to"], filters["due_date_to"]);
             assert_eq!(
@@ -1688,6 +1751,22 @@ async fn outstanding_item_date_filters_and_summaries_cover_all_matching_pages() 
                 assert!(result.get("items").is_none());
             } else {
                 assert_eq!(result["items"].as_array().unwrap().len(), count);
+                let today = chrono::NaiveDate::parse_from_str(
+                    result["as_of_date"].as_str().unwrap(),
+                    "%Y-%m-%d",
+                )
+                .unwrap();
+                for item in result["items"].as_array().unwrap() {
+                    let days = item["due_date"].as_str().map(|date| {
+                        today
+                            .signed_duration_since(
+                                chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+                            )
+                            .num_days()
+                            .max(0)
+                    });
+                    assert_eq!(item["days_overdue"], json!(days));
+                }
             }
             assert_eq!(server.finish().len(), 3);
         }
@@ -2105,4 +2184,138 @@ async fn outstanding_balances_default_page_limit_does_not_truncate_overall_total
         assert_eq!(result["next_offset"], json!(next));
         assert_eq!(server.finish().len(), 1);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_aging_reconciles_across_due_ranges_currencies_and_response_pages() {
+    let today = chrono::Local::now().date_naive();
+    let cases = [
+        (Some(-1), "2.50"),
+        (Some(0), "3.50"),
+        (Some(1), "4.25"),
+        (Some(30), "-1.25"),
+        (Some(31), "5.50"),
+        (Some(60), "6.50"),
+        (Some(61), "7.75"),
+        (Some(90), "8.25"),
+        (Some(91), "-2.00"),
+        (None, "9.00"),
+    ];
+    let mut rows: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (days, amount))| {
+            let mut item = balance_item(
+                index as i64 + 1,
+                COMPANY_ID,
+                "1001",
+                "Alpha",
+                "EUR",
+                serde_json::from_str(amount).unwrap(),
+            );
+            item["DueDate"] =
+                json!(days.map(|days| (today - chrono::Duration::days(days)).to_string()));
+            item["AmountInTransit"] = json!(0.01);
+            item
+        })
+        .collect();
+    let mut other = balance_item(
+        11,
+        "22222222-2222-2222-2222-222222222222",
+        "1002",
+        "Beta",
+        "USD",
+        json!(100),
+    );
+    other["DueDate"] = json!((today - chrono::Duration::days(31)).to_string());
+    rows.push(other);
+    for side in ["payable", "receivable"] {
+        let server = Server::new(vec![
+            Response::json(json!({"d": {"results": rows[..5], "__next": "?page=2"}})),
+            Response::json(json!({"d": rows[5..]})),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let args = serde_json::from_value(json!({"side": side, "limit": 1})).unwrap();
+        let result =
+            serde_json::to_value(backend.get_outstanding_balances(args).await.unwrap()).unwrap();
+        assert_eq!(result["as_of_date"], today.to_string());
+        assert_eq!(result["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(result["matched_account_count"], 2);
+        assert_eq!(result["has_more"], true);
+        let euro = &result["totals_by_currency"]["EUR"];
+        assert_eq!(*euro, result["accounts"][0]["totals_by_currency"]["EUR"]);
+        let aging = &euro["aging_by_due_date"];
+        let money = |value: &Value| {
+            value
+                .as_str()
+                .unwrap()
+                .parse::<rust_decimal::Decimal>()
+                .unwrap()
+        };
+        assert_eq!(aging.as_object().unwrap().len(), 6);
+        for (bucket, count, amount, positive, negative) in [
+            ("current", 2, "6", "6", "0"),
+            ("overdue_1_30_days", 2, "3", "4.25", "-1.25"),
+            ("overdue_31_60_days", 2, "12", "12", "0"),
+            ("overdue_61_90_days", 2, "16", "16", "0"),
+            ("overdue_over_90_days", 1, "-2", "0", "-2"),
+            ("unknown_due_date", 1, "9", "9", "0"),
+        ] {
+            assert_eq!(aging[bucket]["item_count"], count);
+            assert_eq!(
+                money(&aging[bucket]["net_open_amount"]),
+                amount.parse::<rust_decimal::Decimal>().unwrap()
+            );
+            assert_eq!(
+                money(&aging[bucket]["positive_open_amount"]),
+                positive.parse::<rust_decimal::Decimal>().unwrap()
+            );
+            assert_eq!(
+                money(&aging[bucket]["negative_open_amount"]),
+                negative.parse::<rust_decimal::Decimal>().unwrap()
+            );
+        }
+        assert_eq!(
+            money(&euro["net_open_amount"]),
+            "44".parse::<rust_decimal::Decimal>().unwrap()
+        );
+        assert_eq!(
+            money(&euro["overdue_net_amount"]),
+            "29".parse::<rust_decimal::Decimal>().unwrap()
+        );
+        assert_eq!(
+            money(&euro["known_in_transit_amount"]),
+            "0.10".parse::<rust_decimal::Decimal>().unwrap()
+        );
+        assert_eq!(euro["items_without_due_date"], 1);
+        let dollars = &result["totals_by_currency"]["USD"]["aging_by_due_date"];
+        assert_eq!(dollars.as_object().unwrap().len(), 1);
+        assert_eq!(dollars["overdue_31_60_days"]["net_open_amount"], "100");
+        assert_eq!(server.finish().len(), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_net_aging_buckets_retain_both_positive_and_negative_rows() {
+    let server = Server::new(vec![Response::json(json!({"d": [
+        balance_item(1, COMPANY_ID, "1001", "Alpha", "EUR", json!(0.1)),
+        balance_item(2, COMPANY_ID, "1001", "Alpha", "EUR", json!(-0.1))
+    ]}))]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = backend
+        .get_outstanding_balances(
+            serde_json::from_value(json!({"side": "receivable", "overdue_only": true})).unwrap(),
+        )
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    let aging = &result["totals_by_currency"]["EUR"]["aging_by_due_date"];
+    assert_eq!(aging.as_object().unwrap().len(), 1);
+    let bucket = &aging["overdue_over_90_days"];
+    assert_eq!(bucket["item_count"], 2);
+    assert_eq!(bucket["net_open_amount"], "0.0");
+    assert_eq!(bucket["positive_open_amount"], "0.1");
+    assert_eq!(bucket["negative_open_amount"], "-0.1");
+    assert_eq!(result["matched_account_count"], 1);
+    assert_eq!(server.finish().len(), 1);
 }

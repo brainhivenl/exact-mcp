@@ -264,6 +264,11 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
         "0.1"
     );
     assert_eq!(structured["items"][0]["your_ref"], "INV-1");
+    assert!(structured["items"][0]["days_overdue"].as_i64().unwrap() > 90);
+    assert_eq!(
+        structured["totals_by_currency"]["EUR"]["aging_by_due_date"]["overdue_over_90_days"]["net_open_amount"],
+        "0.3"
+    );
     let text = report["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *structured);
     assert!(!report.to_string().contains("fixture-access-token"));
@@ -506,6 +511,10 @@ fn stdio_exact_code_search_and_filtered_summary_return_scoped_totals() {
     assert_eq!(result["source_item_count"], 2);
     assert_eq!(result["matched_item_count"], 2);
     assert_eq!(result["amount_basis"], "exact_report_currency");
+    assert_eq!(
+        result["totals_by_currency"]["EUR"]["aging_by_due_date"]["overdue_over_90_days"]["item_count"],
+        2
+    );
     assert_eq!(result["filters"]["due_date_to"], "2000-01-01");
     assert_eq!(
         result["totals_by_currency"]["EUR"]["net_open_amount"],
@@ -583,6 +592,15 @@ fn stdio_outstanding_balances_cover_all_pages_and_support_invoice_drilldown() {
     );
     assert_eq!(result["next_offset"], 1);
     assert_eq!(result["has_more"], true);
+    assert_eq!(
+        result["totals_by_currency"]["EUR"]["aging_by_due_date"]["overdue_over_90_days"]["net_open_amount"],
+        "0.6"
+    );
+    assert_eq!(
+        result["accounts"][0]["totals_by_currency"]["EUR"]["aging_by_due_date"]["overdue_over_90_days"]
+            ["net_open_amount"],
+        "0.3"
+    );
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     let account_id = &result["accounts"][0]["account"]["id"];
