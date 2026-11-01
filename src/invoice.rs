@@ -46,15 +46,15 @@ pub struct InvoiceDetailsResult {
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
-struct InvoiceEntry {
+pub(crate) struct InvoiceEntry {
     #[serde(rename(deserialize = "EntryID"))]
-    entry_id: Uuid,
+    pub(crate) entry_id: Uuid,
     division: u32,
-    entry_number: i64,
+    pub(crate) entry_number: i64,
     #[serde(rename(deserialize = "Journal"))]
-    journal_code: String,
+    pub(crate) journal_code: String,
     #[serde(alias = "Supplier", alias = "Customer")]
-    account_id: Uuid,
+    pub(crate) account_id: Uuid,
     #[serde(alias = "SupplierName", alias = "CustomerName")]
     account_name: Option<String>,
     currency: String,
@@ -70,7 +70,7 @@ struct InvoiceEntry {
     rate: Option<serde_json::Number>,
     entry_date: Option<ExactDate>,
     due_date: Option<ExactDate>,
-    invoice_number: Option<i64>,
+    pub(crate) invoice_number: Option<i64>,
     your_ref: Option<String>,
     description: Option<String>,
     #[serde(rename(deserialize = "Type"))]
@@ -81,7 +81,7 @@ struct InvoiceEntry {
     status_description: Option<String>,
     reversal: Option<bool>,
     #[serde(rename(deserialize = "Document"))]
-    document_id: Option<Uuid>,
+    pub(crate) document_id: Option<Uuid>,
     document_number: Option<i64>,
     document_subject: Option<String>,
 }
@@ -137,11 +137,11 @@ struct DivisionCurrency {
 const HEADER_FIELDS: &str = "EntryID,Division,EntryNumber,Journal,Currency,AmountDC,AmountFC,VATAmountDC,VATAmountFC,Rate,EntryDate,DueDate,InvoiceNumber,YourRef,Description,Type,TypeDescription,Status,StatusDescription,Reversal,Document,DocumentNumber,DocumentSubject";
 const LINE_FIELDS: &str = "ID,EntryID,Division,LineNumber,Description,GLAccount,GLAccountCode,GLAccountDescription,Quantity,AmountDC,AmountFC,VATAmountDC,VATAmountFC,VATBaseAmountDC,VATBaseAmountFC,VATCode,VATCodeDescription,VATPercentage";
 
-pub(crate) async fn get_details(
+pub(crate) async fn resolve_entry(
     client: &ExactClient,
     administration: &Administration,
-    args: GetInvoiceDetails,
-) -> Result<InvoiceDetailsResult> {
+    args: &GetInvoiceDetails,
+) -> Result<InvoiceEntry> {
     let account_id =
         Uuid::parse_str(&args.account_id).context("account_id must be an Exact account UUID")?;
     ensure!(
@@ -157,17 +157,9 @@ pub(crate) async fn get_details(
         !journal.is_empty() && journal.chars().count() <= 100,
         "journal_code must contain 1–100 characters from get_open_items"
     );
-    let (resource, lines_resource, party) = match args.side {
-        Side::Payable => (
-            "purchaseentry/PurchaseEntries",
-            "purchaseentry/PurchaseEntryLines",
-            "Supplier",
-        ),
-        Side::Receivable => (
-            "salesentry/SalesEntries",
-            "salesentry/SalesEntryLines",
-            "Customer",
-        ),
+    let (resource, party) = match args.side {
+        Side::Payable => ("purchaseentry/PurchaseEntries", "Supplier"),
+        Side::Receivable => ("salesentry/SalesEntries", "Customer"),
     };
     let root = client
         .base_url()
@@ -205,7 +197,22 @@ pub(crate) async fn get_details(
         !entry.currency.is_empty(),
         "Exact returned an invoice without a transaction currency; no details returned"
     );
+    Ok(entry)
+}
 
+pub(crate) async fn get_details(
+    client: &ExactClient,
+    administration: &Administration,
+    args: GetInvoiceDetails,
+) -> Result<InvoiceDetailsResult> {
+    let entry = resolve_entry(client, administration, &args).await?;
+    let root = client
+        .base_url()
+        .join(&format!("/api/v1/{}/", administration.code))?;
+    let lines_resource = match args.side {
+        Side::Payable => "purchaseentry/PurchaseEntryLines",
+        Side::Receivable => "salesentry/SalesEntryLines",
+    };
     let mut division_url = root.join("system/Divisions")?;
     division_url
         .query_pairs_mut()

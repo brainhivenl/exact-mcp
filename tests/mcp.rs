@@ -200,10 +200,16 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 6);
     for tool in tools {
-        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            tool["name"] != "download_invoice_pdf"
+        );
         assert_eq!(tool["annotations"]["destructiveHint"], false);
+        if tool["name"] == "download_invoice_pdf" {
+            assert_eq!(tool["annotations"]["idempotentHint"], false);
+        }
         assert!(matches!(
             tool["name"].as_str(),
             Some(
@@ -211,6 +217,8 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                     | "get_open_items"
                     | "get_outstanding_balances"
                     | "get_invoice_details"
+                    | "list_invoice_documents"
+                    | "download_invoice_pdf"
             )
         ));
     }
@@ -252,6 +260,13 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
         .unwrap()["inputSchema"]["properties"];
     for field in ["account_id", "side", "entry_number", "journal_code"] {
         assert!(invoice_schema[field].is_object());
+    }
+    let download_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "download_invoice_pdf")
+        .unwrap()["inputSchema"]["properties"];
+    for field in ["invoice", "document_id", "attachment_id"] {
+        assert!(download_schema[field].is_object());
     }
     let search = process.request(
         3,
@@ -711,6 +726,80 @@ fn stdio_invoice_accounting_details_preserve_signs_vat_and_currency_context() {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     assert!(!response.to_string().contains("fixture-access-token"));
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_invoice_pdf_download_writes_only_a_private_local_pdf_and_returns_no_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let pdf = "%PDF-1.7\nsynthetic-private-pdf-content\n%%EOF\n";
+    let api = thread::spawn(move || {
+        let entry_id = "44444444-4444-4444-4444-444444444444";
+        let document_id = "55555555-5555-5555-5555-555555555555";
+        let attachment_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let header = json!({"EntryID":entry_id,"Division":42,"EntryNumber":12345,"Journal":"60","Supplier":ACCOUNT_ID,"Currency":"USD","Document":document_id});
+        let document = json!({"ID":document_id,"Division":42,"Account":ACCOUNT_ID,"Type":20,"TypeDescription":"Purchase invoice","Subject":"Invoice","FinancialTransactionEntryID":entry_id});
+        let attachment = json!({"ID":attachment_id,"Document":document_id,"FileName":"invoice.pdf","FileSize":pdf.len(),"Url":"https://untrusted.invalid/do-not-follow"});
+        let responses = [
+            (
+                "/api/v1/42/purchaseentry/PurchaseEntries?",
+                json!({"d":[header]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/Documents?",
+                json!({"d":[document.clone()]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/Documents?",
+                json!({"d":[document]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/DocumentAttachments?",
+                json!({"d":[attachment.clone()]}).to_string(),
+            ),
+            ("/docs/SysAttachment.aspx?", pdf.to_owned()),
+            (
+                "/api/v1/42/documents/DocumentAttachments?",
+                json!({"d":[attachment]}).to_string(),
+            ),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with(&format!("GET {path}")), "{target}");
+            let content_type = if path.starts_with("/docs/") {
+                "application/pdf"
+            } else {
+                "application/json"
+            };
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response = process.request(2,"tools/call",json!({"name":"download_invoice_pdf","arguments":{
+        "invoice":{"account_id":ACCOUNT_ID,"side":"payable","entry_number":12345,"journal_code":"60"},
+        "document_id":"55555555-5555-5555-5555-555555555555","attachment_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    }}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    let path = PathBuf::from(result["saved_path"].as_str().unwrap());
+    assert!(path.starts_with(directory.canonicalize().unwrap().join("downloads/42")));
+    assert_eq!(std::fs::read(&path).unwrap(), pdf.as_bytes());
+    assert_eq!(result["byte_count"], pdf.len());
+    assert_eq!(result["media_type"], "application/pdf");
+    assert!(
+        !response
+            .to_string()
+            .contains("synthetic-private-pdf-content")
+    );
+    assert!(!response.to_string().contains("fixture-access-token"));
+    assert!(!response.to_string().contains("untrusted.invalid"));
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     api.join().unwrap();
     process.shutdown();
 }

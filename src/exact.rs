@@ -154,6 +154,81 @@ impl ExactClient {
         self.refreshes.wait().await;
     }
 
+    pub async fn get_invoice_pdf_bytes(
+        &self,
+        division: u32,
+        attachment_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            self.pinned_administration == Some(division),
+            "Attachment administration must match the selected administration"
+        );
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let mut url = self.base_url.join("/docs/SysAttachment.aspx")?;
+        url.query_pairs_mut()
+            .append_pair("ID", &attachment_id.to_string())
+            .append_pair("_Division_", &division.to_string())
+            .append_pair("Download", "1");
+        let token = self.access_token().await?;
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let mut response = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/pdf")
+            .send()
+            .await
+            .context("Exact PDF download request failed")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("Exact rejected authorization; run `exact-mcp auth login` again");
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            bail!("Exact API rate limit reached (HTTP 429); wait before trying again");
+        }
+        ensure!(
+            status.is_success(),
+            "Exact PDF download request failed (HTTP {status})"
+        );
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= limit as u64),
+            "Exact PDF download response exceeds the download size limit"
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Cannot read Exact PDF download response")?
+        {
+            ensure!(
+                body.len().saturating_add(chunk.len()) <= limit,
+                "Exact PDF download response exceeds the download size limit"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    pub async fn save_invoice_pdf(
+        &self,
+        division: u32,
+        attachment_id: uuid::Uuid,
+        bytes: Vec<u8>,
+    ) -> Result<PathBuf> {
+        ensure!(
+            self.pinned_administration == Some(division),
+            "Download administration must match the selected administration"
+        );
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let store = Store::open(&self.directory).await?;
+        let session = store.require_session().await?;
+        self.check_scope(&session)?;
+        store.save_invoice_pdf(division, attachment_id, bytes).await
+    }
+
     pub async fn get_collection<T: DeserializeOwned>(&self, url: Url) -> Result<Vec<T>> {
         self.read_collection(url, 0, None).await
     }

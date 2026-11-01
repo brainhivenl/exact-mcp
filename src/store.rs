@@ -117,6 +117,53 @@ impl Store {
             .context("Session save task failed")?
     }
 
+    pub async fn save_invoice_pdf(
+        &self,
+        division: u32,
+        attachment_id: uuid::Uuid,
+        bytes: Vec<u8>,
+    ) -> Result<PathBuf> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut directory = store.directory.clone();
+            for component in ["downloads".to_owned(), division.to_string()] {
+                directory.push(component);
+                let mut builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                match builder.create(&directory) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).context("Cannot create invoice download directory");
+                    }
+                }
+                check_private(&directory)?;
+                anyhow::ensure!(
+                    directory.is_dir(),
+                    "Invoice download path must be a directory"
+                );
+            }
+            let mut file = tempfile::Builder::new()
+                .prefix(&format!("invoice-{attachment_id}-"))
+                .suffix(".part")
+                .tempfile_in(&directory)?;
+            file.write_all(&bytes)?;
+            file.as_file().sync_all()?;
+            let path = file.path().with_extension("pdf");
+            file.persist_noclobber(&path)
+                .context("Cannot save invoice PDF without overwriting an existing file")?;
+            #[cfg(unix)]
+            File::open(&directory)?.sync_all()?;
+            fs::canonicalize(path).context("Cannot resolve saved invoice PDF path")
+        })
+        .await
+        .context("Invoice PDF save task failed")?
+    }
+
     fn save_sync(&self, session: &Session) -> Result<()> {
         let mut temporary = NamedTempFile::new_in(&self.directory)?;
         serde_json::to_writer_pretty(&mut temporary, session)?;

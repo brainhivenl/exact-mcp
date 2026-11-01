@@ -373,6 +373,20 @@ impl Backend {
         self.client.shutdown().await;
     }
 
+    pub async fn list_invoice_documents(
+        &self,
+        args: crate::invoice::GetInvoiceDetails,
+    ) -> Result<crate::pdf::InvoiceDocumentsResult> {
+        crate::pdf::list_documents(&self.client, &self.administration, args).await
+    }
+
+    pub async fn download_invoice_pdf(
+        &self,
+        args: crate::pdf::DownloadInvoicePdf,
+    ) -> Result<crate::pdf::DownloadedInvoicePdf> {
+        crate::pdf::download_pdf(&self.client, &self.administration, args).await
+    }
+
     pub async fn get_invoice_details(
         &self,
         args: crate::invoice::GetInvoiceDetails,

@@ -3,6 +3,7 @@ mod financial;
 mod invoice;
 mod mcp;
 mod oauth;
+mod pdf;
 mod store;
 
 #[cfg(test)]

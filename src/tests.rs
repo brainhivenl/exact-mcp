@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -2702,4 +2704,543 @@ async fn invoice_permission_and_pagination_errors_return_no_partial_details_or_r
         assert!(!text.contains("private token and invoice details"));
         assert_eq!(server.finish().len(), count);
     }
+}
+
+const PDF_DOCUMENT_ID: &str = "55555555-5555-5555-5555-555555555555";
+const PDF_ATTACHMENT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const PDF_BYTES: &[u8] = b"%PDF-1.7\nmock invoice\n%%EOF\n";
+
+fn pdf_document() -> Value {
+    json!({"ID": PDF_DOCUMENT_ID, "Division": 42, "Account": COMPANY_ID,
+        "Type": 20, "TypeDescription": "Purchase invoice", "Subject": "Invoice",
+        "FinancialTransactionEntryID": INVOICE_ENTRY_ID, "SalesInvoiceNumber": null})
+}
+
+fn pdf_attachment() -> Value {
+    json!({"ID": PDF_ATTACHMENT_ID, "Document": PDF_DOCUMENT_ID,
+        "FileName": "../../session.json.pdf", "FileSize": PDF_BYTES.len(),
+        "Url": "https://untrusted.invalid/never-follow-this?token=private"})
+}
+
+fn pdf_catalog_responses() -> Vec<Response> {
+    vec![
+        Response::json(json!({"d":[invoice_header("payable")]})),
+        Response::json(json!({"d":[pdf_document()]})),
+        Response::json(json!({"d":[pdf_document()]})),
+        Response::json(json!({"d":[pdf_attachment()]})),
+    ]
+}
+
+fn pdf_response(bytes: &[u8]) -> Response {
+    Response {
+        status: "200 OK",
+        body: String::from_utf8(bytes.to_vec()).unwrap(),
+        location: None,
+    }
+}
+
+fn pdf_args() -> crate::pdf::DownloadInvoicePdf {
+    serde_json::from_value(json!({"invoice":{"account_id":COMPANY_ID,"side":"payable","entry_number":12345,"journal_code":"60"},"document_id":PDF_DOCUMENT_ID,"attachment_id":PDF_ATTACHMENT_ID})).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_pdf_download_revalidates_links_ignores_urls_and_saves_private_unique_files() {
+    let mut responses = pdf_catalog_responses();
+    responses.push(pdf_response(PDF_BYTES));
+    responses.push(Response::json(json!({"d":[pdf_attachment()]})));
+    responses.extend(pdf_catalog_responses());
+    responses.push(pdf_response(PDF_BYTES));
+    responses.push(Response::json(json!({"d":[pdf_attachment()]})));
+    let server = Server::new(responses);
+    let (directory, backend) = financial_backend(&server.base).await;
+    let mut paths = Vec::new();
+    for _ in 0..2 {
+        let result =
+            serde_json::to_value(backend.download_invoice_pdf(pdf_args()).await.unwrap()).unwrap();
+        let path = PathBuf::from(result["saved_path"].as_str().unwrap());
+        assert!(
+            path.starts_with(
+                directory
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("downloads/42")
+            )
+        );
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("invoice-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa-")
+        );
+        assert_eq!(path.extension().unwrap(), "pdf");
+        assert_eq!(fs::read(&path).unwrap(), PDF_BYTES);
+        assert_eq!(result["original_file_name"], "../../session.json.pdf");
+        assert_eq!(result["byte_count"], PDF_BYTES.len());
+        assert_eq!(result["media_type"], "application/pdf");
+        assert_eq!(result["document"]["type_code"], 20);
+        assert!(!result.to_string().contains("untrusted.invalid"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        paths.push(path);
+    }
+    assert_ne!(paths[0], paths[1]);
+    let store = Store::open(directory.path()).await.unwrap();
+    assert_eq!(
+        store.require_session().await.unwrap().tokens.access_token,
+        "old-access"
+    );
+    drop(store);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 12);
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.target.starts_with("GET /api/v1/42/")
+                || r.target.starts_with("GET /docs/SysAttachment.aspx?"))
+    );
+    let binary = server_url(requests[4].target.split_whitespace().nth(1).unwrap());
+    assert_eq!(binary.path(), "/docs/SysAttachment.aspx");
+    assert!(
+        binary
+            .query_pairs()
+            .any(|(key, value)| key == "ID" && value == PDF_ATTACHMENT_ID)
+    );
+    assert!(
+        binary
+            .query_pairs()
+            .any(|(key, value)| key == "Download" && value == "1")
+    );
+    assert!(
+        binary
+            .query_pairs()
+            .any(|(key, value)| key == "_Division_" && value == "42")
+    );
+    let url = server_url(requests[5].target.split_whitespace().nth(1).unwrap());
+    assert_eq!(url.path(), "/api/v1/42/documents/DocumentAttachments");
+    let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        parameters["$filter"],
+        format!("ID eq guid'{PDF_ATTACHMENT_ID}' and Document eq guid'{PDF_DOCUMENT_ID}'")
+    );
+    assert_eq!(parameters["$select"], "ID,Document,FileName,FileSize");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_document_catalog_lists_provenance_without_downloading_bytes() {
+    let server = Server::new(pdf_catalog_responses());
+    let (directory, backend) = financial_backend(&server.base).await;
+    let result = serde_json::to_value(
+        backend
+            .list_invoice_documents(invoice_args("payable"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["documents"].as_array().unwrap().len(), 1);
+    let doc = &result["documents"][0];
+    assert_eq!(doc["invoice_type_match"], true);
+    assert_eq!(
+        doc["sources"],
+        json!(["accounting_header", "accounting_entry"])
+    );
+    assert_eq!(doc["attachments"][0]["pdf_filename"], true);
+    assert_eq!(doc["attachments"][0]["id"], PDF_ATTACHMENT_ID);
+    assert!(!directory.path().join("downloads").exists());
+    assert!(!result.to_string().contains("untrusted.invalid"));
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    let url = server_url(requests[3].target.split_whitespace().nth(1).unwrap());
+    assert!(
+        url.query_pairs()
+            .any(|(k, v)| k == "$select" && v == "ID,Document,FileName,FileSize")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_pdf_rejects_reminders_unrelated_ids_changed_metadata_and_invalid_content() {
+    for case in [
+        "reminder",
+        "document",
+        "attachment",
+        "changed-id",
+        "changed-document",
+        "changed-name",
+        "html",
+        "truncated",
+        "duplicate",
+        "next-page",
+        "redirect",
+    ] {
+        let mut responses = pdf_catalog_responses();
+        let mut args = pdf_args();
+        let mut fresh = pdf_attachment();
+        let mut include_download = true;
+        let mut include_fresh = true;
+        let mut response = pdf_response(PDF_BYTES);
+        match case {
+            "reminder" => {
+                let mut doc = pdf_document();
+                doc["Type"] = json!(15);
+                responses[1] = Response::json(json!({"d":[doc]}));
+                responses[2] = Response::json(json!({"d":[doc]}));
+                include_download = false;
+            }
+            "document" => {
+                args.document_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into();
+                include_download = false;
+            }
+            "attachment" => {
+                args.attachment_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into();
+                include_download = false;
+            }
+            "changed-id" => fresh["ID"] = json!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            "changed-document" => fresh["Document"] = json!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            "changed-name" => fresh["FileName"] = json!("other.pdf"),
+            "html" => {
+                response = pdf_response(b"<html>not a PDF</html>");
+                include_fresh = false;
+            }
+            "truncated" => {
+                response = pdf_response(b"%PDF-1.7\nmissing EOF");
+                include_fresh = false;
+            }
+            "redirect" => {
+                response = Response {
+                    status: "302 Found",
+                    body: "private data".into(),
+                    location: Some("http://127.0.0.1:1/stolen".into()),
+                };
+                include_fresh = false;
+            }
+            _ => {}
+        }
+        if include_download {
+            responses.push(response);
+            if include_fresh {
+                responses.push(Response::json(if case == "duplicate" {
+                    json!({"d":[fresh,fresh]})
+                } else if case == "next-page" {
+                    json!({"d":{"results":[fresh],"__next":"http://127.0.0.1:1/stolen"}})
+                } else {
+                    json!({"d":[fresh]})
+                }));
+            }
+        }
+        let count = responses.len();
+        let server = Server::new(responses);
+        let (directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.download_invoice_pdf(args).await.is_err(), "{case}");
+        assert!(!directory.path().join("downloads").exists(), "{case}");
+        assert_eq!(server.finish().len(), count);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_document_metadata_cannot_cross_accounts_entries_or_administrations() {
+    for (key, value) in [
+        ("Account", json!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+        ("Division", json!(99)),
+        (
+            "FinancialTransactionEntryID",
+            json!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        ),
+    ] {
+        let mut doc = pdf_document();
+        doc[key] = value;
+        let server = Server::new(vec![
+            Response::json(json!({"d":[invoice_header("payable")]})),
+            Response::json(json!({"d":[doc]})),
+        ]);
+        let (directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .list_invoice_documents(invoice_args("payable"))
+                .await
+                .is_err()
+        );
+        assert!(!directory.path().join("downloads").exists());
+        assert_eq!(server.finish().len(), 2);
+    }
+    for case in ["wrong-document", "duplicate"] {
+        let mut responses = pdf_catalog_responses();
+        let mut attachment = pdf_attachment();
+        if case == "wrong-document" {
+            attachment["Document"] = json!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        }
+        responses[3] = Response::json(if case == "duplicate" {
+            json!({"d":[attachment,attachment]})
+        } else {
+            json!({"d":[attachment]})
+        });
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .list_invoice_documents(invoice_args("payable"))
+                .await
+                .is_err()
+        );
+        assert_eq!(server.finish().len(), 4);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sales_invoice_document_discovery_uses_commercial_invoice_uuid_and_does_not_confuse_reminders()
+ {
+    let sales_id = "99999999-9999-9999-9999-999999999999";
+    let reminder_id = "88888888-8888-8888-8888-888888888888";
+    let mut header = invoice_header("receivable");
+    header["Document"] = Value::Null;
+    let mut original = pdf_document();
+    original["Type"] = json!(10);
+    original["FinancialTransactionEntryID"] = json!(sales_id);
+    let mut reminder = pdf_document();
+    reminder["ID"] = json!(reminder_id);
+    reminder["Type"] = json!(15);
+    reminder["TypeDescription"] = json!("Reminder");
+    let mut reminder_attachment = pdf_attachment();
+    reminder_attachment["ID"] = json!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    reminder_attachment["Document"] = json!(reminder_id);
+    let server = Server::new(vec![
+        Response::json(json!({"d":[header]})),
+        Response::json(
+            json!({"d":[{"InvoiceID":sales_id,"Division":42,"InvoiceNumber":12345,"InvoiceTo":COMPANY_ID,"Journal":"70","Document":null}]}),
+        ),
+        Response::json(json!({"d":[reminder]})),
+        Response::json(json!({"d":[original]})),
+        Response::json(json!({"d":[pdf_attachment()]})),
+        Response::json(json!({"d":[reminder_attachment]})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = serde_json::to_value(
+        backend
+            .list_invoice_documents(invoice_args("receivable"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["documents"].as_array().unwrap().len(), 2);
+    assert_eq!(result["documents"][0]["id"], PDF_DOCUMENT_ID);
+    assert_eq!(result["documents"][0]["invoice_type_match"], true);
+    assert_eq!(result["documents"][0]["sources"], json!(["sales_invoice"]));
+    assert_eq!(result["documents"][1]["invoice_type_match"], false);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 6);
+    let url = server_url(requests[1].target.split_whitespace().nth(1).unwrap());
+    assert_eq!(url.path(), "/api/v1/42/salesinvoice/SalesInvoices");
+    let url = server_url(requests[3].target.split_whitespace().nth(1).unwrap());
+    assert!(
+        url.query_pairs().any(|(k, v)| k == "$filter"
+            && v == format!("FinancialTransactionEntryID eq guid'{sales_id}'"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_attachment_http_body_limits_apply_with_and_without_content_length() {
+    let server = Server::new(vec![Response::json(
+        json!({"d":[{"Attachment":"X".repeat(256)}]}),
+    )]);
+    let (_directory, mut client) = async_exact_client(&server.base, false).await;
+    client.pin_administration().unwrap();
+    let result = client
+        .get_invoice_pdf_bytes(42, uuid::Uuid::parse_str(PDF_ATTACHMENT_ID).unwrap(), 32)
+        .await;
+    assert!(result.is_err());
+    assert_eq!(server.finish().len(), 1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let task = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_async_request(&mut stream).await;
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n40\r\n{}\r\n0\r\n\r\n","X".repeat(64)).as_bytes()).await.unwrap();
+    });
+    let (_directory, mut client) = async_exact_client(&base, false).await;
+    client.pin_administration().unwrap();
+    assert!(
+        client
+            .get_invoice_pdf_bytes(42, uuid::Uuid::parse_str(PDF_ATTACHMENT_ID).unwrap(), 32)
+            .await
+            .is_err()
+    );
+    task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_binary_size_limit_rejects_advertised_oversize_before_reading() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let task = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_async_request(&mut stream).await;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    crate::pdf::MAX_PDF_BYTES + 1
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (directory, mut client) = async_exact_client(&base, false).await;
+    client.pin_administration().unwrap();
+    let error = client
+        .get_invoice_pdf_bytes(
+            42,
+            uuid::Uuid::parse_str(PDF_ATTACHMENT_ID).unwrap(),
+            crate::pdf::MAX_PDF_BYTES,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("size limit"));
+    assert!(!directory.path().join("downloads").exists());
+    task.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_pdf_storage_rejects_public_directories_and_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for symbolic in [false, true] {
+        let directory = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let store = Store::open(directory.path()).await.unwrap();
+        let downloads = directory.path().join("downloads");
+        if symbolic {
+            symlink(outside.path(), &downloads).unwrap();
+        } else {
+            fs::create_dir(&downloads).unwrap();
+            fs::set_permissions(&downloads, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            store
+                .save_invoice_pdf(
+                    42,
+                    uuid::Uuid::parse_str(PDF_ATTACHMENT_ID).unwrap(),
+                    PDF_BYTES.to_vec()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_pdf_inputs_and_final_save_reject_invalid_ids_or_changed_scope() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for (document, attachment) in [
+        ("not-a-uuid", PDF_ATTACHMENT_ID),
+        (PDF_DOCUMENT_ID, "00000000-0000-0000-0000-000000000000"),
+    ] {
+        let mut args = pdf_args();
+        args.document_id = document.into();
+        args.attachment_id = attachment.into();
+        let error = backend.download_invoice_pdf(args).await.err().unwrap();
+        assert!(!format!("{error:#}").contains("request failed"));
+    }
+    let mut value=serde_json::to_value(json!({"invoice":{"account_id":COMPANY_ID,"side":"payable","entry_number":12345,"journal_code":"60"},"document_id":PDF_DOCUMENT_ID,"attachment_id":PDF_ATTACHMENT_ID})).unwrap();
+    value["output_path"] = json!("/tmp/arbitrary.pdf");
+    assert!(serde_json::from_value::<crate::pdf::DownloadInvoicePdf>(value).is_err());
+    let (directory, mut client) =
+        async_exact_client(&Url::parse("http://127.0.0.1:1").unwrap(), false).await;
+    client.pin_administration().unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let mut state = store.require_session().await.unwrap();
+    state.administration.as_mut().unwrap().code = 99;
+    store.save(&state).await.unwrap();
+    drop(store);
+    let error = client
+        .save_invoice_pdf(
+            42,
+            uuid::Uuid::parse_str(PDF_ATTACHMENT_ID).unwrap(),
+            PDF_BYTES.to_vec(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("restart"));
+    assert!(!directory.path().join("downloads").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commercial_invoice_document_mapping_rejects_wrong_or_ambiguous_invoices() {
+    let mut header = invoice_header("receivable");
+    header["Document"] = Value::Null;
+    let valid = json!({"InvoiceID":"99999999-9999-9999-9999-999999999999","Division":42,"InvoiceNumber":12345,"InvoiceTo":COMPANY_ID,"Journal":"70","Document":null});
+    let mut cases = vec![vec![valid.clone(), valid.clone()]];
+    for (key, value) in [
+        ("InvoiceTo", json!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")),
+        ("Division", json!(99)),
+        ("InvoiceNumber", json!(54321)),
+        ("Journal", json!("60")),
+        ("InvoiceID", json!("00000000-0000-0000-0000-000000000000")),
+    ] {
+        let mut invoice = valid.clone();
+        invoice[key] = value;
+        cases.push(vec![invoice]);
+    }
+    for invoices in cases {
+        let server = Server::new(vec![
+            Response::json(json!({"d":[header]})),
+            Response::json(json!({"d":invoices})),
+        ]);
+        let (directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .list_invoice_documents(invoice_args("receivable"))
+                .await
+                .is_err()
+        );
+        assert!(!directory.path().join("downloads").exists());
+        assert_eq!(server.finish().len(), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_original_invoice_pdfs_are_not_generated_or_guessed() {
+    let mut header = invoice_header("receivable");
+    header["Document"] = Value::Null;
+    let server = Server::new(vec![
+        Response::json(json!({"d":[header]})),
+        Response::json(json!({"d":[]})),
+        Response::json(json!({"d":[]})),
+    ]);
+    let (directory, backend) = financial_backend(&server.base).await;
+    let result = serde_json::to_value(
+        backend
+            .list_invoice_documents(invoice_args("receivable"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["documents"], json!([]));
+    assert!(!directory.path().join("downloads").exists());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.target.starts_with("GET "))
+    );
 }
