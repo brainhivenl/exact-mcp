@@ -58,7 +58,7 @@ pub enum Side {
 #[serde(deny_unknown_fields)]
 pub struct GetOpenItems {
     #[schemars(
-        description = "Exact account UUID returned by search_accounts; never a guessed company name or code."
+        description = "Exact account UUID returned by search_accounts or get_outstanding_balances; never a guessed company name or code."
     )]
     pub account_id: String,
     #[schemars(
@@ -87,11 +87,63 @@ pub struct GetOpenItems {
     pub summary_only: bool,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetOutstandingBalances {
+    #[schemars(
+        description = "payable: amounts owed to suppliers; receivable: amounts owed by customers. Query each side separately."
+    )]
+    pub side: Side,
+    #[schemars(
+        with = "Option<String>",
+        description = "Inclusive earliest due date, YYYY-MM-DD. Excludes items without a due date."
+    )]
+    pub due_date_from: Option<NaiveDate>,
+    #[schemars(
+        with = "Option<String>",
+        description = "Inclusive latest due date, YYYY-MM-DD. Excludes items without a due date."
+    )]
+    pub due_date_to: Option<NaiveDate>,
+    #[serde(default)]
+    #[schemars(
+        description = "Only include items due before the local as_of_date. Excludes unknown due dates."
+    )]
+    pub overdue_only: bool,
+    #[schemars(
+        description = "Maximum account summaries, between 1 and 50. Defaults to 50. Totals always include all matching accounts, not just this page."
+    )]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Number of matching accounts to skip. Use next_offset from the previous result with unchanged filters and limit."
+    )]
+    pub offset: u32,
+}
+
 #[derive(Serialize)]
 struct OpenItemFilters {
     due_date_from: Option<NaiveDate>,
     due_date_to: Option<NaiveDate>,
     overdue_only: bool,
+}
+
+impl OpenItemFilters {
+    fn validate(&self) -> Result<()> {
+        if let (Some(from), Some(to)) = (self.due_date_from, self.due_date_to) {
+            ensure!(from <= to, "due_date_from must not be after due_date_to");
+        }
+        Ok(())
+    }
+
+    fn matches(&self, due_date: Option<NaiveDate>, today: NaiveDate) -> bool {
+        (!self.overdue_only || due_date.is_some_and(|date| date < today))
+            && self
+                .due_date_from
+                .is_none_or(|from| due_date.is_some_and(|date| date >= from))
+            && self
+                .due_date_to
+                .is_none_or(|to| due_date.is_some_and(|date| date <= to))
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -135,6 +187,49 @@ pub struct OpenItemsResult {
     items: Option<Vec<OpenItem>>,
     totals_by_currency: BTreeMap<String, CurrencyTotals>,
     interpretation: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct OutstandingBalancesResult {
+    administration: Administration,
+    retrieved_at: String,
+    as_of_date: NaiveDate,
+    as_of_utc_offset: String,
+    side: Side,
+    amount_basis: &'static str,
+    filters: OpenItemFilters,
+    source_item_count: usize,
+    matched_item_count: usize,
+    source_account_count: usize,
+    matched_account_count: usize,
+    offset: u32,
+    accounts: Vec<AccountBalance>,
+    has_more: bool,
+    next_offset: Option<u32>,
+    totals_by_currency: BTreeMap<String, CurrencyTotals>,
+    interpretation: &'static str,
+}
+
+#[derive(Serialize)]
+struct BalanceAccount {
+    id: Uuid,
+    code: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct AccountBalance {
+    account: BalanceAccount,
+    totals_by_currency: BTreeMap<String, CurrencyTotals>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawAccountOpenItem {
+    account_code: String,
+    account_name: String,
+    #[serde(flatten)]
+    item: RawOpenItem,
 }
 
 #[derive(Deserialize)]
@@ -183,7 +278,33 @@ pub struct CurrencyTotals {
     items_without_due_date: usize,
 }
 
+impl CurrencyTotals {
+    fn add_item(&mut self, item: &RawOpenItem, today: NaiveDate) -> Result<()> {
+        self.item_count += 1;
+        self.net_open_amount.add(item.amount)?;
+        if item.amount.0 > Decimal::ZERO {
+            self.positive_open_amount.add(item.amount)?;
+        } else if item.amount.0 < Decimal::ZERO {
+            self.negative_open_amount.add(item.amount)?;
+        }
+        let due_date = item.due_date.as_ref().map(|date| date.0);
+        if due_date.is_some_and(|date| date < today) {
+            self.overdue_net_amount.add(item.amount)?;
+        }
+        if due_date.is_none() {
+            self.items_without_due_date += 1;
+        }
+        match item.amount_in_transit {
+            Some(amount) => self.known_in_transit_amount.add(amount)?,
+            None => self.items_with_unknown_in_transit += 1,
+        }
+        Ok(())
+    }
+}
+
 const ACCOUNT_FIELDS: &str = "ID,Code,Name,IsSupplier,IsSales";
+const BALANCE_FIELDS: &str =
+    "HID,AccountId,AccountCode,AccountName,Amount,AmountInTransit,CurrencyCode,DueDate";
 const ITEM_FIELDS: &str = "HID,AccountId,Amount,AmountInTransit,CurrencyCode,DueDate,InvoiceDate,InvoiceNumber,EntryNumber,JournalCode,YourRef,Description";
 
 impl Backend {
@@ -254,11 +375,14 @@ impl Backend {
     }
 
     pub async fn get_open_items(&self, args: GetOpenItems) -> Result<OpenItemsResult> {
-        if let (Some(from), Some(to)) = (args.due_date_from, args.due_date_to) {
-            ensure!(from <= to, "due_date_from must not be after due_date_to");
-        }
+        let filters = OpenItemFilters {
+            due_date_from: args.due_date_from,
+            due_date_to: args.due_date_to,
+            overdue_only: args.overdue_only,
+        };
+        filters.validate()?;
         let account_id = Uuid::parse_str(&args.account_id)
-            .context("account_id must be an Exact account UUID from search_accounts")?;
+            .context("account_id must be an Exact account UUID from search_accounts or get_outstanding_balances")?;
         let mut account_url = self.resource_url("crm/Accounts")?;
         account_url
             .query_pairs_mut()
@@ -301,37 +425,16 @@ impl Backend {
                 !currency.is_empty(),
                 "Exact returned an item without a currency; no totals returned"
             );
-            let due_date = raw.due_date.map(|date| date.0);
+            let due_date = raw.due_date.as_ref().map(|date| date.0);
             let overdue = due_date.map(|date| date < today);
-            if args.overdue_only && overdue != Some(true)
-                || args
-                    .due_date_from
-                    .is_some_and(|from| due_date.is_none_or(|date| date < from))
-                || args
-                    .due_date_to
-                    .is_some_and(|to| due_date.is_none_or(|date| date > to))
-            {
+            if !filters.matches(due_date, today) {
                 continue;
             }
             matched_item_count += 1;
-            let total = totals.entry(currency.clone()).or_default();
-            total.item_count += 1;
-            total.net_open_amount.add(raw.amount)?;
-            if raw.amount.0 > Decimal::ZERO {
-                total.positive_open_amount.add(raw.amount)?;
-            } else if raw.amount.0 < Decimal::ZERO {
-                total.negative_open_amount.add(raw.amount)?;
-            }
-            if overdue == Some(true) {
-                total.overdue_net_amount.add(raw.amount)?;
-            }
-            if due_date.is_none() {
-                total.items_without_due_date += 1;
-            }
-            match raw.amount_in_transit {
-                Some(amount) => total.known_in_transit_amount.add(amount)?,
-                None => total.items_with_unknown_in_transit += 1,
-            }
+            totals
+                .entry(currency.clone())
+                .or_default()
+                .add_item(&raw, today)?;
             if let Some(items) = &mut items {
                 items.push(OpenItem {
                     hid: raw.hid,
@@ -357,17 +460,135 @@ impl Backend {
             account,
             side: args.side,
             amount_basis: "exact_report_currency",
-            filters: OpenItemFilters {
-                due_date_from: args.due_date_from,
-                due_date_to: args.due_date_to,
-                overdue_only: args.overdue_only,
-            },
+            filters,
             source_item_count,
             matched_item_count,
             summary_only: args.summary_only,
             items,
             totals_by_currency: totals,
             interpretation: "Totals cover only items matching the echoed filters, across all fetched pages; source_item_count is before filtering and matched_item_count is after filtering. Summary-only responses omit rows, not matching amounts. Current outstanding-item report, not a historical snapshot or proof of bank settlement. Amounts and currency codes are reported by Exact and can be in the administration's reporting currency rather than the original invoice currency; this server does not convert currencies or expose original foreign-currency amounts. For purchase entries, invoice_number is Exact's entry number, not the supplier's invoice reference; use your_ref when available. Amounts are decimal strings with Exact's signs preserved; positive and negative rows are shown separately, without classifying a negative row as a credit note versus unmatched payment. In-transit amounts are reported separately and NOT subtracted from open amounts. Null transit amounts and missing due dates remain unknown. Overdue means due before the local machine's as_of_date; signed overdue totals can include negative rows. Different currencies and payable/receivable sides are never offset. Source data can change while pages are fetched.",
+        })
+    }
+
+    pub async fn get_outstanding_balances(
+        &self,
+        args: GetOutstandingBalances,
+    ) -> Result<OutstandingBalancesResult> {
+        let filters = OpenItemFilters {
+            due_date_from: args.due_date_from,
+            due_date_to: args.due_date_to,
+            overdue_only: args.overdue_only,
+        };
+        filters.validate()?;
+        let limit = args.limit.unwrap_or(50);
+        ensure!(
+            (1..=50).contains(&limit),
+            "Account limit must be between 1 and 50"
+        );
+        let next_offset = args
+            .offset
+            .checked_add(limit)
+            .context("Account offset is too large")?;
+        let resource = match args.side {
+            Side::Payable => "read/financial/PayablesList",
+            Side::Receivable => "read/financial/ReceivablesList",
+        };
+        let mut url = self.resource_url(resource)?;
+        url.query_pairs_mut().append_pair("$select", BALANCE_FIELDS);
+        let rows: Vec<RawAccountOpenItem> = self.client.get_collection(url).await?;
+        let current = Local::now();
+        let today = current.date_naive();
+        let source_item_count = rows.len();
+        let mut matched_item_count = 0;
+        let mut totals = BTreeMap::<String, CurrencyTotals>::new();
+        let mut accounts = BTreeMap::<Uuid, AccountBalance>::new();
+        let mut ids = HashSet::new();
+        for raw in rows {
+            let item = raw.item;
+            ensure!(
+                !item.account_id.is_nil(),
+                "Exact returned an item without an account; no totals returned"
+            );
+            ensure!(
+                ids.insert(item.hid.clone()),
+                "Exact returned duplicate outstanding items; retry before using totals"
+            );
+            ensure!(
+                !raw.account_code.trim().is_empty() && !raw.account_name.trim().is_empty(),
+                "Exact returned incomplete account details; no totals returned"
+            );
+            let currency = item.currency_code.trim().to_owned();
+            ensure!(
+                !currency.is_empty(),
+                "Exact returned an item without a currency; no totals returned"
+            );
+            let account = accounts
+                .entry(item.account_id)
+                .or_insert_with(|| AccountBalance {
+                    account: BalanceAccount {
+                        id: item.account_id,
+                        code: raw.account_code.clone(),
+                        name: raw.account_name.clone(),
+                    },
+                    totals_by_currency: BTreeMap::new(),
+                });
+            ensure!(
+                account.account.code == raw.account_code
+                    && account.account.name == raw.account_name,
+                "Exact returned inconsistent account details; retry before using totals"
+            );
+            let due_date = item.due_date.as_ref().map(|date| date.0);
+            if !filters.matches(due_date, today) {
+                continue;
+            }
+            matched_item_count += 1;
+            totals
+                .entry(currency.clone())
+                .or_default()
+                .add_item(&item, today)?;
+            account
+                .totals_by_currency
+                .entry(currency)
+                .or_default()
+                .add_item(&item, today)?;
+        }
+        let source_account_count = accounts.len();
+        let mut accounts: Vec<_> = accounts
+            .into_values()
+            .filter(|account| !account.totals_by_currency.is_empty())
+            .collect();
+        accounts.sort_by(|left, right| {
+            (&left.account.name, &left.account.code, left.account.id).cmp(&(
+                &right.account.name,
+                &right.account.code,
+                right.account.id,
+            ))
+        });
+        let matched_account_count = accounts.len();
+        let has_more = matched_account_count > next_offset as usize;
+        let accounts = accounts
+            .into_iter()
+            .skip(args.offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok(OutstandingBalancesResult {
+            administration: self.administration.clone(),
+            retrieved_at: Utc::now().to_rfc3339(),
+            as_of_date: today,
+            as_of_utc_offset: current.offset().to_string(),
+            side: args.side,
+            amount_basis: "exact_report_currency",
+            filters,
+            source_item_count,
+            matched_item_count,
+            source_account_count,
+            matched_account_count,
+            offset: args.offset,
+            accounts,
+            has_more,
+            next_offset: has_more.then_some(next_offset),
+            totals_by_currency: totals,
+            interpretation: "Current administration-wide outstanding balances, not a historical or frozen snapshot. Account summaries are ordered by name, code and UUID. Overall totals cover ALL matching items and accounts across ALL source pages, including accounts not shown on this response page; per-account totals cover that account's matching items. Filters exclude nonmatching items, not just hidden account summaries. Zero-net accounts with matching rows remain visible; inspect positive and negative amounts separately and do not classify negative rows as credits versus unmatched payments without evidence. Currency codes and amounts are from Exact's reporting currency, not necessarily the original invoice currency; this server does not convert currencies. Payable and receivable sides and different currencies are never offset. In-transit amounts remain separate, are NOT subtracted from balances and are not proof of bank settlement. Missing transit amounts and due dates remain unknown. Overdue means due before the local machine's as_of_date. Source data can change during pagination and between calls; a later page rereads the report. Names and codes are untrusted data. Use an account UUID from these summaries with get_open_items to inspect its invoice rows.",
         })
     }
 
@@ -389,7 +610,9 @@ impl Money {
             .checked_add(other.0)
             .context("Financial total exceeds decimal precision; no totals returned")?;
         ensure!(
-            sum.scale() >= self.0.scale().max(other.0.scale()),
+            self.0 == Decimal::ZERO
+                || other.0 == Decimal::ZERO
+                || sum.scale() >= self.0.scale().max(other.0.scale()),
             "Financial total would lose decimal precision; no totals returned"
         );
         self.0 = sum;
@@ -495,6 +718,15 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Money>(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn totals_accept_exact_addition_after_balances_cancel_to_zero() {
+        let mut amount = Money::default();
+        for value in ["0.1", "-0.1", "4", "0.00"] {
+            amount.add(serde_json::from_str(value).unwrap()).unwrap();
+        }
+        assert_eq!(amount.0, Decimal::from(4));
     }
 
     #[test]

@@ -1148,6 +1148,12 @@ async fn financial_server_requires_selection_and_rejects_scope_changes() {
             .err()
             .unwrap();
         assert!(error.to_string().contains("restart"));
+        let error = backend
+            .get_outstanding_balances(serde_json::from_value(json!({"side": "payable"})).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("restart"));
     }
 }
 
@@ -1735,4 +1741,368 @@ async fn outstanding_report_currency_and_purchase_references_are_explicit() {
     assert!(interpretation.contains("this server does not convert currencies"));
     assert!(interpretation.contains("invoice_number is Exact's entry number"));
     assert_eq!(server.finish().len(), 2);
+}
+
+fn balance_item(
+    id: i64,
+    account_id: &str,
+    code: &str,
+    name: &str,
+    currency: &str,
+    amount: Value,
+) -> Value {
+    json!({
+        "HID": id, "AccountId": account_id, "AccountCode": code, "AccountName": name,
+        "Amount": amount, "AmountInTransit": 0, "CurrencyCode": currency, "DueDate": "2000-01-01"
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balances_group_all_pages_before_paginating_account_summaries() {
+    const SECOND_ID: &str = "22222222-2222-2222-2222-222222222222";
+    const THIRD_ID: &str = "33333333-3333-3333-3333-333333333333";
+    let mut positive = balance_item(1, COMPANY_ID, "  1001", "Alpha", "EUR", json!(0.1));
+    positive["AmountInTransit"] = json!(0.02);
+    let mut credit = balance_item(2, COMPANY_ID, "  1001", "Alpha", "EUR", json!(-0.1));
+    credit["AmountInTransit"] = Value::Null;
+    credit["HID"] = json!("2");
+    let beta = balance_item(3, SECOND_ID, "1002", "Beta", "USD", json!(2.5));
+    let beta_euros = balance_item(6, SECOND_ID, "1002", "Beta", "EUR", json!(1.75));
+    let mut future = balance_item(4, THIRD_ID, "1003", "Gamma", "EUR", json!(4));
+    future["DueDate"] = json!("9999-01-01");
+    let mut unknown = balance_item(5, THIRD_ID, "1003", "Gamma", "EUR", json!(5));
+    unknown["DueDate"] = Value::Null;
+    for (offset, expected_name, next) in [
+        (0, Some("Alpha"), Some(1)),
+        (1, Some("Beta"), Some(2)),
+        (2, Some("Gamma"), None),
+        (3, None, None),
+    ] {
+        let server = Server::new(vec![
+            Response::json(json!({"d": {"results": [beta, positive], "__next": "?page=2"}})),
+            Response::json(json!({"d": [credit, future, unknown, beta_euros]})),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let args = serde_json::from_value(json!({"side": "payable", "limit": 1, "offset": offset}))
+            .unwrap();
+        let result =
+            serde_json::to_value(backend.get_outstanding_balances(args).await.unwrap()).unwrap();
+        assert_eq!(result["administration"]["Code"], 42);
+        assert_eq!(result["side"], "payable");
+        assert_eq!(result["amount_basis"], "exact_report_currency");
+        assert_eq!(result["source_item_count"], 6);
+        assert_eq!(result["matched_item_count"], 6);
+        assert_eq!(result["source_account_count"], 3);
+        assert_eq!(result["matched_account_count"], 3);
+        assert_eq!(result["offset"], offset);
+        assert_eq!(result["next_offset"], json!(next));
+        assert_eq!(result["has_more"], next.is_some());
+        let euros = &result["totals_by_currency"]["EUR"];
+        assert_eq!(euros["net_open_amount"], "10.75");
+        assert_eq!(euros["positive_open_amount"], "10.85");
+        assert_eq!(euros["negative_open_amount"], "-0.1");
+        assert_eq!(euros["overdue_net_amount"], "1.75");
+        assert_eq!(euros["known_in_transit_amount"], "0.02");
+        assert_eq!(euros["items_with_unknown_in_transit"], 1);
+        assert_eq!(euros["items_without_due_date"], 1);
+        assert_eq!(
+            result["totals_by_currency"]["USD"]["net_open_amount"],
+            "2.5"
+        );
+        if let Some(name) = expected_name {
+            assert_eq!(result["accounts"].as_array().unwrap().len(), 1);
+            assert_eq!(result["accounts"][0]["account"]["name"], name);
+            if name == "Alpha" {
+                assert_eq!(result["accounts"][0]["account"]["code"], "  1001");
+                let totals = &result["accounts"][0]["totals_by_currency"]["EUR"];
+                assert_eq!(totals["net_open_amount"], "0.0");
+                assert_eq!(totals["item_count"], 2);
+                assert_eq!(totals["negative_open_amount"], "-0.1");
+            } else if name == "Beta" {
+                let totals = &result["accounts"][0]["totals_by_currency"];
+                assert_eq!(totals.as_object().unwrap().len(), 2);
+                assert_eq!(totals["EUR"]["net_open_amount"], "1.75");
+                assert_eq!(totals["USD"]["net_open_amount"], "2.5");
+            }
+        } else {
+            assert_eq!(result["accounts"], json!([]));
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        let url = server_url(requests[0].target.split_whitespace().nth(1).unwrap());
+        assert_eq!(url.path(), "/api/v1/42/read/financial/PayablesList");
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert!(parameters["$select"].contains("AccountCode,AccountName"));
+        assert!(!parameters.contains_key("accountId"));
+        assert!(!parameters.contains_key("$top"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balances_filter_items_before_totalling_and_counting_accounts() {
+    let today = chrono::Local::now().date_naive();
+    let yesterday = today.pred_opt().unwrap();
+    let tomorrow = today.succ_opt().unwrap();
+    let mut overdue = balance_item(1, COMPANY_ID, "1001", "Alpha", "EUR", json!(1));
+    overdue["DueDate"] = json!(yesterday.to_string());
+    let mut due_today = balance_item(2, COMPANY_ID, "1001", "Alpha", "EUR", json!(2));
+    due_today["DueDate"] = json!(today.to_string());
+    let mut future = balance_item(
+        3,
+        "22222222-2222-2222-2222-222222222222",
+        "1002",
+        "Beta",
+        "EUR",
+        json!(3),
+    );
+    future["DueDate"] = json!(tomorrow.to_string());
+    let mut unknown = balance_item(
+        4,
+        "33333333-3333-3333-3333-333333333333",
+        "1003",
+        "Gamma",
+        "EUR",
+        json!(4),
+    );
+    unknown["DueDate"] = Value::Null;
+    for (filters, count, accounts, amount) in [
+        (json!({}), 4, 3, "10"),
+        (json!({"overdue_only": true}), 1, 1, "1"),
+        (
+            json!({"due_date_from": today, "due_date_to": today}),
+            1,
+            1,
+            "2",
+        ),
+        (json!({"due_date_from": today}), 2, 2, "5"),
+        (json!({"due_date_to": today}), 2, 1, "3"),
+        (
+            json!({"due_date_from": today, "overdue_only": true}),
+            0,
+            0,
+            "0",
+        ),
+    ] {
+        let server = Server::new(vec![Response::json(
+            json!({"d": [overdue, due_today, future, unknown]}),
+        )]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = filters.clone();
+        args["side"] = json!("receivable");
+        let result = serde_json::to_value(
+            backend
+                .get_outstanding_balances(serde_json::from_value(args).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["source_item_count"], 4);
+        assert_eq!(result["source_account_count"], 3);
+        assert_eq!(result["matched_item_count"], count);
+        assert_eq!(result["matched_account_count"], accounts);
+        assert_eq!(result["accounts"].as_array().unwrap().len(), accounts);
+        assert_eq!(result["filters"]["due_date_from"], filters["due_date_from"]);
+        assert_eq!(result["filters"]["due_date_to"], filters["due_date_to"]);
+        assert_eq!(result["has_more"], false);
+        assert_eq!(result["next_offset"], Value::Null);
+        if count > 0 {
+            assert_eq!(
+                result["totals_by_currency"]["EUR"]["net_open_amount"],
+                amount
+            );
+        } else {
+            assert_eq!(result["totals_by_currency"], json!({}));
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .target
+                .contains("/42/read/financial/ReceivablesList?")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balances_return_an_explicit_empty_report() {
+    let server = Server::new(vec![Response::json(json!({"d": []}))]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result = backend
+        .get_outstanding_balances(serde_json::from_value(json!({"side": "receivable"})).unwrap())
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    for key in [
+        "source_item_count",
+        "matched_item_count",
+        "source_account_count",
+        "matched_account_count",
+    ] {
+        assert_eq!(result[key], 0);
+    }
+    assert_eq!(result["accounts"], json!([]));
+    assert_eq!(result["totals_by_currency"], json!({}));
+    assert_eq!(result["has_more"], false);
+    assert_eq!(result["next_offset"], Value::Null);
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balances_reject_bad_rows_even_when_excluded_by_filters() {
+    let valid = balance_item(1, COMPANY_ID, "1001", "Alpha", "EUR", json!(1));
+    let mut inconsistent_name = valid.clone();
+    inconsistent_name["HID"] = json!(2);
+    inconsistent_name["AccountName"] = json!("Changed name");
+    let mut inconsistent_code = inconsistent_name.clone();
+    inconsistent_code["AccountName"] = json!("Alpha");
+    inconsistent_code["AccountCode"] = json!("1002");
+    let mut duplicate_other_account = valid.clone();
+    duplicate_other_account["AccountId"] = json!("22222222-2222-2222-2222-222222222222");
+    let mut cases = vec![
+        vec![valid.clone(), valid.clone()],
+        vec![valid.clone(), duplicate_other_account],
+        vec![valid.clone(), inconsistent_name],
+        vec![valid.clone(), inconsistent_code],
+    ];
+    for (key, value) in [
+        ("CurrencyCode", json!(" ")),
+        ("AccountName", json!(" ")),
+        ("AccountCode", json!(" ")),
+        ("AccountId", json!("00000000-0000-0000-0000-000000000000")),
+        ("AccountId", Value::Null),
+        ("DueDate", json!("invalid")),
+    ] {
+        let mut row = valid.clone();
+        row[key] = value;
+        cases.push(vec![row]);
+    }
+    for rows in cases {
+        let server = Server::new(vec![Response::json(json!({"d": rows}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let result = backend
+            .get_outstanding_balances(
+                serde_json::from_value(json!({"side": "payable", "due_date_from": "9999-01-01"}))
+                    .unwrap(),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balances_preserve_decimal_precision_and_reject_global_overflow() {
+    for (first, second, expected) in [
+        ("9007199254740993.01", "0.02", Some("9007199254740993.03")),
+        ("79228162514264337593543950335", "1", None),
+        ("79228162514264337593543950335", "0.1", None),
+    ] {
+        let server = Server::new(vec![Response::json(json!({"d": [
+            balance_item(1, COMPANY_ID, "1001", "Alpha", "EUR", serde_json::from_str(first).unwrap()),
+            balance_item(2, "22222222-2222-2222-2222-222222222222", "1002", "Beta", "EUR", serde_json::from_str(second).unwrap())
+        ]}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let result = backend
+            .get_outstanding_balances(
+                serde_json::from_value(json!({"side": "payable", "limit": 1})).unwrap(),
+            )
+            .await;
+        if let Some(expected) = expected {
+            let result = serde_json::to_value(result.unwrap()).unwrap();
+            assert_eq!(
+                result["totals_by_currency"]["EUR"]["net_open_amount"],
+                expected
+            );
+            assert_eq!(
+                result["accounts"][0]["totals_by_currency"]["EUR"]["net_open_amount"],
+                first
+            );
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balances_never_return_partial_totals_on_failed_source_pagination() {
+    let server = Server::new(vec![
+        Response::json(
+            json!({"d": {"results": [balance_item(1, COMPANY_ID, "1001", "Alpha", "EUR", json!(1))], "__next": "?page=2"}}),
+        ),
+        Response {
+            status: "429 Too Many Requests",
+            body: "private financial data".into(),
+            location: None,
+        },
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let error = backend
+        .get_outstanding_balances(serde_json::from_value(json!({"side": "payable"})).unwrap())
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("429"));
+    assert!(!format!("{error:#}").contains("private financial data"));
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balance_inputs_are_validated_before_network_access() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for args in [
+        json!({"side": "payable", "limit": 0}),
+        json!({"side": "payable", "limit": 51}),
+        json!({"side": "receivable", "offset": u32::MAX}),
+        json!({"side": "receivable", "due_date_from": "2026-02-01", "due_date_to": "2026-01-01"}),
+    ] {
+        let error = backend
+            .get_outstanding_balances(serde_json::from_value(args).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.to_string().contains("request failed"));
+    }
+    for args in [
+        json!({"side": "both"}),
+        json!({"side": "payable", "due_date_to": "2026-02-30"}),
+        json!({"side": "payable", "offset": -1}),
+        json!({"side": "payable", "account_id": COMPANY_ID}),
+    ] {
+        assert!(serde_json::from_value::<crate::financial::GetOutstandingBalances>(args).is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outstanding_balances_default_page_limit_does_not_truncate_overall_totals() {
+    let rows: Vec<_> = (1..=51)
+        .rev()
+        .map(|index| {
+            balance_item(
+                index,
+                &uuid::Uuid::from_u128(index as u128).to_string(),
+                &format!("{index:04}"),
+                &format!("Company {index:02}"),
+                "EUR",
+                json!(1),
+            )
+        })
+        .collect();
+    for (offset, count, next) in [(0, 50, Some(50)), (50, 1, None)] {
+        let server = Server::new(vec![Response::json(json!({"d": rows}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let args = serde_json::from_value(json!({"side": "payable", "offset": offset})).unwrap();
+        let result =
+            serde_json::to_value(backend.get_outstanding_balances(args).await.unwrap()).unwrap();
+        assert_eq!(result["accounts"].as_array().unwrap().len(), count);
+        assert_eq!(
+            result["accounts"][0]["account"]["name"],
+            format!("Company {:02}", offset + 1)
+        );
+        assert_eq!(result["matched_account_count"], 51);
+        assert_eq!(result["matched_item_count"], 51);
+        assert_eq!(result["totals_by_currency"]["EUR"]["net_open_amount"], "51");
+        assert_eq!(result["next_offset"], json!(next));
+        assert_eq!(server.finish().len(), 1);
+    }
 }

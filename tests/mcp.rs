@@ -200,13 +200,13 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 2);
+    assert_eq!(tools.len(), 3);
     for tool in tools {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
         assert_eq!(tool["annotations"]["destructiveHint"], false);
         assert!(matches!(
             tool["name"].as_str(),
-            Some("search_accounts" | "get_open_items")
+            Some("search_accounts" | "get_open_items" | "get_outstanding_balances")
         ));
     }
     let search_schema = &tools
@@ -226,6 +226,20 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
         "summary_only",
     ] {
         assert!(report_schema[field].is_object());
+    }
+    let balances_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "get_outstanding_balances")
+        .unwrap()["inputSchema"]["properties"];
+    for field in [
+        "side",
+        "due_date_from",
+        "due_date_to",
+        "overdue_only",
+        "limit",
+        "offset",
+    ] {
+        assert!(balances_schema[field].is_object());
     }
     let search = process.request(
         3,
@@ -268,6 +282,16 @@ fn stdio_tool_errors_and_administration_changes_do_not_require_api_access() {
     for (id, name, arguments) in [
         (2, "search_accounts", json!({"query": ""})),
         (
+            5,
+            "get_outstanding_balances",
+            json!({"side": "payable", "limit": 0}),
+        ),
+        (
+            6,
+            "get_outstanding_balances",
+            json!({"side": "receivable", "due_date_from": "2026-02-01", "due_date_to": "2026-01-01"}),
+        ),
+        (
             3,
             "get_open_items",
             json!({"account_id": "not-a-uuid", "side": "receivable"}),
@@ -292,6 +316,18 @@ fn stdio_tool_errors_and_administration_changes_do_not_require_api_access() {
         4,
         "tools/call",
         json!({"name": "search_accounts", "arguments": {"query": "Company"}}),
+    );
+    assert_eq!(response["result"]["isError"], true);
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("restart")
+    );
+    let response = process.request(
+        7,
+        "tools/call",
+        json!({"name": "get_outstanding_balances", "arguments": {"side": "payable"}}),
     );
     assert_eq!(response["result"]["isError"], true);
     assert!(
@@ -484,5 +520,85 @@ fn stdio_exact_code_search_and_filtered_summary_return_scoped_totals() {
     let parameters: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
     assert_eq!(parameters["$filter"], "trim(Code) eq '1001'");
     assert!(targets[2].contains("ReceivablesListByAccount"));
+    process.shutdown();
+}
+
+#[test]
+fn stdio_outstanding_balances_cover_all_pages_and_support_invoice_drilldown() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let api = thread::spawn(move || {
+        let account = json!({"ID": ACCOUNT_ID, "Code": "1001", "Name": "Company X", "IsSupplier": true, "IsSales": false});
+        let first = json!({"HID": 1, "AccountId": ACCOUNT_ID, "AccountCode": "1001", "AccountName": "Company X", "Amount": 0.1, "AmountInTransit": 0, "CurrencyCode": "EUR", "DueDate": "2000-01-01"});
+        let mut second = first.clone();
+        second["HID"] = json!(2);
+        second["Amount"] = json!(0.2);
+        let mut other = first.clone();
+        other["HID"] = json!(3);
+        other["AccountId"] = json!("22222222-2222-2222-2222-222222222222");
+        other["AccountCode"] = json!("1002");
+        other["AccountName"] = json!("Second company");
+        other["Amount"] = json!(0.3);
+        let responses = [
+            (
+                "/read/financial/PayablesList?",
+                json!({"d": {"results": [first.clone(), other], "__next": "?page=2"}}),
+            ),
+            (
+                "/read/financial/PayablesList?page=2",
+                json!({"d": [second.clone()]}),
+            ),
+            ("/crm/Accounts?", json!({"d": [account]})),
+            (
+                "/read/financial/PayablesListByAccount?",
+                json!({"d": [first, second]}),
+            ),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"), "{target}");
+            assert!(target.contains(path), "{target}");
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response = process.request(2, "tools/call", json!({"name": "get_outstanding_balances", "arguments": {"side": "payable", "overdue_only": true, "limit": 1}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["administration"]["Code"], 42);
+    assert_eq!(result["source_item_count"], 3);
+    assert_eq!(result["matched_account_count"], 2);
+    assert_eq!(result["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(result["accounts"][0]["account"]["id"], ACCOUNT_ID);
+    assert_eq!(
+        result["accounts"][0]["totals_by_currency"]["EUR"]["net_open_amount"],
+        "0.3"
+    );
+    assert_eq!(
+        result["totals_by_currency"]["EUR"]["net_open_amount"],
+        "0.6"
+    );
+    assert_eq!(result["next_offset"], 1);
+    assert_eq!(result["has_more"], true);
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    let account_id = &result["accounts"][0]["account"]["id"];
+    let details = process.request(3, "tools/call", json!({"name": "get_open_items", "arguments": {"account_id": account_id, "side": "payable"}}));
+    assert_ne!(details["result"]["isError"], true, "{details}");
+    assert_eq!(
+        details["result"]["structuredContent"]["totals_by_currency"]["EUR"],
+        result["accounts"][0]["totals_by_currency"]["EUR"]
+    );
+    assert_eq!(
+        details["result"]["structuredContent"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    api.join().unwrap();
     process.shutdown();
 }
