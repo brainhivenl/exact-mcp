@@ -387,6 +387,20 @@ impl Backend {
         crate::pdf::download_pdf(&self.client, &self.administration, args).await
     }
 
+    pub async fn search_gl_accounts(
+        &self,
+        args: crate::ledger::SearchGlAccounts,
+    ) -> Result<crate::ledger::GlAccountSearchResult> {
+        crate::ledger::search_accounts(&self.client, &self.administration, args).await
+    }
+
+    pub async fn get_ledger_report(
+        &self,
+        args: crate::ledger::GetLedgerReport,
+    ) -> Result<crate::ledger::LedgerReport> {
+        crate::ledger::get_report(&self.client, &self.administration, args).await
+    }
+
     pub async fn get_payment_details(
         &self,
         args: crate::payment::GetPaymentDetails,
@@ -691,7 +705,7 @@ impl Backend {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
 pub(crate) struct Money(Decimal);
 
 impl Money {

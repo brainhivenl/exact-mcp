@@ -4302,3 +4302,332 @@ async fn payment_details_fail_source_errors_without_partial_postings_or_response
         assert_eq!(server.finish().len(), position + 1);
     }
 }
+
+const GL_ID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+fn gl_account() -> Value {
+    json!({"ID":GL_ID,"Division":42,"Code":" 01200 ","Description":"Trade accounts","Type":20,"TypeDescription":"Accounts receivable","BalanceSide":"C","BalanceType":"B","IsBlocked":true})
+}
+
+fn ledger_args() -> crate::ledger::GetLedgerReport {
+    serde_json::from_value(
+        json!({"gl_account_id":GL_ID,"financial_year":2025,"period_from":0,"period_to":13}),
+    )
+    .unwrap()
+}
+
+fn ledger_line(id: &str, amount: Value, period: i32, status: i32) -> Value {
+    let mut line = matching_ledger(12345, "70", id);
+    line["GLAccount"] = json!(GL_ID);
+    line["AmountDC"] = amount;
+    line["FinancialPeriod"] = json!(period);
+    line["Status"] = json!(status);
+    line
+}
+
+fn ledger_setup() -> Vec<Response> {
+    vec![
+        Response::json(json!({"d":[gl_account()]})),
+        division_currency_response(),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gl_account_search_preserves_codes_validates_every_page_and_includes_blocked_accounts() {
+    for code_mode in [false, true] {
+        let first = gl_account();
+        let mut second = first.clone();
+        second["ID"] = json!("cccccccc-cccc-cccc-cccc-cccccccccccc");
+        second["Code"] = json!("1200");
+        second["Description"] = json!("TRADE costs");
+        let server = Server::new(vec![
+            Response::json(json!({"d":{"results":[second],"__next":"?page=2"}})),
+            Response::json(json!({"d":[first]})),
+        ]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let args=serde_json::from_value(json!({"query":if code_mode {"01200"} else {"TRADE"},"match_by":if code_mode {"code"} else {"description"},"limit":1})).unwrap();
+        let result = serde_json::to_value(backend.search_gl_accounts(args).await.unwrap()).unwrap();
+        assert_eq!(result["accounts"][0]["code"], " 01200 ");
+        assert_eq!(result["accounts"][0]["is_blocked"], true);
+        assert_eq!(
+            result["matched_account_count"],
+            if code_mode { 1 } else { 2 }
+        );
+        assert_eq!(result["has_more"], !code_mode);
+        assert_eq!(server.finish().len(), 2);
+    }
+    for bad in [
+        json!({"Division":43}),
+        json!({"ID":uuid::Uuid::nil().to_string()}),
+        json!({"Code":" "}),
+    ] {
+        let mut row = gl_account();
+        row.as_object_mut()
+            .unwrap()
+            .extend(bad.as_object().unwrap().clone());
+        row["Description"] = json!("excluded");
+        let server = Server::new(vec![Response::json(json!({"d":[row]}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .search_gl_accounts(serde_json::from_value(json!({"query":"no match"})).unwrap())
+                .await
+                .is_err()
+        );
+        server.finish();
+    }
+    let server = Server::new(vec![Response::json(
+        json!({"d":[gl_account(),gl_account()]}),
+    )]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    assert!(
+        backend
+            .search_gl_accounts(serde_json::from_value(json!({"query":"Trade"})).unwrap())
+            .await
+            .is_err()
+    );
+    server.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_totals_cover_all_pages_statuses_signs_and_currencies_before_row_pagination() {
+    for (offset, summary) in [(0, false), (1, false), (0, true)] {
+        let mut first = ledger_line("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(0.1), 0, 20);
+        first["Date"] = json!("2025-01-01");
+        first["Currency"] = json!("USD");
+        first["AmountFC"] = json!(1000);
+        let mut second = ledger_line("22222222-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(-0.1), 1, 20);
+        second["Date"] = json!("2025-02-01");
+        second["Currency"] = json!("GBP");
+        second["AmountFC"] = json!(-9000);
+        let mut third = ledger_line("33333333-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(0.2), 13, 50);
+        third["Date"] = Value::Null;
+        third["Account"] = Value::Null;
+        third["AmountFC"] = Value::Null;
+        third["Currency"] = Value::Null;
+        let mut responses = ledger_setup();
+        responses.push(Response::json(
+            json!({"d":{"results":[third,second],"__next":"?page=2"}}),
+        ));
+        responses.push(Response::json(json!({"d":[first]})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = ledger_args();
+        args.limit = Some(1);
+        args.offset = offset;
+        args.summary_only = summary;
+        let result = serde_json::to_value(backend.get_ledger_report(args).await.unwrap()).unwrap();
+        assert_eq!(result["totals"]["line_count"], 3);
+        assert_eq!(result["totals"]["net_movement_default_currency"], "0.2");
+        assert_eq!(
+            result["totals"]["positive_movement_default_currency"],
+            "0.3"
+        );
+        assert_eq!(
+            result["totals"]["negative_movement_default_currency"],
+            "-0.1"
+        );
+        assert_eq!(
+            result["totals_by_status"]["20"]["net_movement_default_currency"],
+            "0.0"
+        );
+        assert_eq!(result["totals_by_status"]["20"]["line_count"], 2);
+        assert_eq!(
+            result["totals_by_status"]["50"]["net_movement_default_currency"],
+            "0.2"
+        );
+        assert_eq!(result["default_currency"], "EUR");
+        assert!(result.get("opening_balance").is_none());
+        if summary {
+            assert!(result.get("transactions").is_none());
+            assert_eq!(result["has_more"], false);
+        } else {
+            assert_eq!(
+                result["transactions"][0]["id"],
+                if offset == 0 {
+                    "11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                } else {
+                    "22222222-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                }
+            );
+            assert_eq!(result["has_more"], true);
+            assert_eq!(result["next_offset"], offset + 1);
+        }
+        let base = server.base.clone();
+        let requests = server.finish();
+        let url = base
+            .join(requests[2].target.split_whitespace().nth(1).unwrap())
+            .unwrap();
+        let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            params["$filter"],
+            format!(
+                "GLAccount eq guid'{GL_ID}' and FinancialYear eq 2025 and FinancialPeriod ge 0 and FinancialPeriod le 13"
+            )
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.target.starts_with("GET ") && r.body.is_empty())
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_explicit_status_and_empty_or_zero_net_selections_remain_explicit() {
+    for count in [0, 2] {
+        let mut responses = ledger_setup();
+        let rows = if count == 0 {
+            json!([])
+        } else {
+            json!([
+                ledger_line("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(12), 1, 50),
+                ledger_line("22222222-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(-12), 1, 50)
+            ])
+        };
+        responses.push(Response::json(json!({"d":rows})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = ledger_args();
+        args.status = Some(50);
+        let result = serde_json::to_value(backend.get_ledger_report(args).await.unwrap()).unwrap();
+        assert_eq!(result["totals"]["net_movement_default_currency"], "0");
+        assert_eq!(result["totals"]["line_count"], count);
+        assert_eq!(result["status_filter"], 50);
+        assert_eq!(result["has_more"], false);
+        let requests = server.finish();
+        assert!(requests[2].target.contains("Status+eq+50"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_inputs_are_validated_before_network_and_source_scope_is_enforced() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for fields in [
+        json!({"gl_account_id":"bad"}),
+        json!({"gl_account_id":uuid::Uuid::nil().to_string()}),
+        json!({"financial_year":0}),
+        json!({"period_from":-1}),
+        json!({"period_from":14,"period_to":13}),
+        json!({"period_to":32768}),
+        json!({"status":5}),
+        json!({"limit":0}),
+        json!({"limit":201}),
+        json!({"offset":u32::MAX}),
+    ] {
+        let mut args =
+            json!({"gl_account_id":GL_ID,"financial_year":2025,"period_from":0,"period_to":13});
+        args.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let error = backend
+            .get_ledger_report(serde_json::from_value(args).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(!format!("{error:#}").contains("request failed"));
+    }
+    for fields in [
+        json!({"query":" "}),
+        json!({"query":"x".repeat(101)}),
+        json!({"query":"X","limit":0}),
+        json!({"query":"X","limit":51}),
+        json!({"query":"X","offset":u32::MAX}),
+    ] {
+        assert!(
+            backend
+                .search_gl_accounts(serde_json::from_value(fields).unwrap())
+                .await
+                .is_err()
+        );
+    }
+    for field in [
+        "Division",
+        "GLAccount",
+        "GLAccountCode",
+        "FinancialYear",
+        "FinancialPeriod",
+        "Status",
+        "ID",
+        "EntryID",
+        "JournalCode",
+    ] {
+        let mut row = ledger_line("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(1), 1, 50);
+        row[field] = match field {
+            "Division" => json!(43),
+            "GLAccount" => json!(COMPANY_ID),
+            "GLAccountCode" => json!("other"),
+            "FinancialYear" => json!(2024),
+            "FinancialPeriod" => json!(14),
+            "Status" => json!(20),
+            "ID" | "EntryID" => json!(uuid::Uuid::nil().to_string()),
+            _ => json!(" "),
+        };
+        let mut responses = ledger_setup();
+        responses.push(Response::json(json!({"d":[row]})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = ledger_args();
+        args.status = Some(50);
+        assert!(backend.get_ledger_report(args).await.is_err());
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_missing_amounts_duplicates_failed_paging_and_decimal_overflow_return_no_totals() {
+    let row = ledger_line("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(1), 1, 20);
+    for tail in [
+        Response::json(json!({"d":[row.clone()]})),
+        Response {
+            status: "403 Forbidden",
+            location: None,
+            body: "PRIVATE_FINANCIAL_TEXT".into(),
+        },
+    ] {
+        let mut responses = ledger_setup();
+        responses.push(Response::json(
+            json!({"d":{"results":[row.clone()],"__next":"?page=2"}}),
+        ));
+        responses.push(tail);
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let error = backend
+            .get_ledger_report(ledger_args())
+            .await
+            .err()
+            .unwrap();
+        assert!(!format!("{error:#}").contains("PRIVATE_FINANCIAL_TEXT"));
+        server.finish();
+    }
+    let max: Value = serde_json::from_str("79228162514264337593543950335").unwrap();
+    for rows in [
+        json!([ledger_line(
+            "11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            Value::Null,
+            1,
+            20
+        )]),
+        json!([
+            ledger_line("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", max, 1, 20),
+            ledger_line("22222222-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(1), 1, 20)
+        ]),
+    ] {
+        let mut responses = ledger_setup();
+        responses.push(Response::json(json!({"d":rows})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.get_ledger_report(ledger_args()).await.is_err());
+        server.finish();
+    }
+    for accounts in [
+        json!([]),
+        json!([gl_account(), gl_account()]),
+        json!([{"ID":COMPANY_ID,"Division":42,"Code":"01200"}]),
+    ] {
+        let server = Server::new(vec![Response::json(json!({"d":accounts}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.get_ledger_report(ledger_args()).await.is_err());
+        assert_eq!(server.finish().len(), 1);
+    }
+}

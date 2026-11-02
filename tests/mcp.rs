@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 11);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -220,6 +220,8 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                     | "get_invoice_details"
                     | "get_invoice_matches"
                     | "get_payment_details"
+                    | "search_gl_accounts"
+                    | "get_ledger_report"
                     | "list_invoice_documents"
                     | "download_invoice_pdf"
             )
@@ -999,6 +1001,88 @@ fn stdio_payment_details_are_read_only_posting_evidence_not_payment_execution() 
     assert!(!directory.join("downloads").exists());
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_gl_lookup_and_period_report_keep_all_page_totals_and_status_breakdowns() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let gl = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let api = thread::spawn(move || {
+        let account = json!({"ID":gl,"Division":42,"Code":" 00100 ","Description":"Compute services","BalanceSide":"C","BalanceType":"W"});
+        let line = |id: &str, status: i32, amount: Value, currency: &str| json!({"ID":id,"EntryID":"44444444-4444-4444-4444-444444444444","Division":42,"GLAccount":gl,"GLAccountCode":"00100","EntryNumber":12345,"FinancialYear":2025,"FinancialPeriod":13,"JournalCode":"60","LineNumber":1,"Status":status,"Date":"2025-12-31","AmountDC":amount,"AmountFC":100,"Currency":currency});
+        let responses = [
+            ("/financial/GLAccounts?", json!({"d":[account.clone()]})),
+            ("/financial/GLAccounts?", json!({"d":[account]})),
+            (
+                "/system/Divisions?",
+                json!({"d":[{"Code":42,"Currency":"EUR"}]}),
+            ),
+            (
+                "/financialtransaction/TransactionLines?",
+                json!({"d":{"results":[line("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa",20,json!(0.1),"USD")],"__next":"?page=2"}}),
+            ),
+            (
+                "/financialtransaction/TransactionLines?page=2",
+                json!({"d":[line("22222222-aaaa-aaaa-aaaa-aaaaaaaaaaaa",50,json!(0.2),"GBP")]}),
+            ),
+        ];
+        for (index, (path, body)) in responses.into_iter().enumerate() {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"));
+            assert!(target.contains(path));
+            if index == 3 {
+                let url = reqwest::Url::parse(&format!(
+                    "http://localhost{}",
+                    target.split_whitespace().nth(1).unwrap()
+                ))
+                .unwrap();
+                let parameters: std::collections::HashMap<_, _> =
+                    url.query_pairs().into_owned().collect();
+                assert_eq!(
+                    parameters["$filter"],
+                    format!(
+                        "GLAccount eq guid'{gl}' and FinancialYear eq 2025 and FinancialPeriod ge 13 and FinancialPeriod le 13"
+                    )
+                );
+            }
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let found = process.request(
+        2,
+        "tools/call",
+        json!({"name":"search_gl_accounts","arguments":{"query":"00100","match_by":"code"}}),
+    );
+    assert_ne!(found["result"]["isError"], true, "{found}");
+    let selected = &found["result"]["structuredContent"]["accounts"][0];
+    assert_eq!(selected["id"], gl);
+    let response=process.request(3,"tools/call",json!({"name":"get_ledger_report","arguments":{"gl_account_id":selected["id"],"financial_year":2025,"period_from":13,"period_to":13,"limit":1}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let report = &response["result"]["structuredContent"];
+    assert_eq!(report["totals"]["line_count"], 2);
+    assert_eq!(report["totals"]["net_movement_default_currency"], "0.3");
+    assert_eq!(
+        report["totals_by_status"]["20"]["net_movement_default_currency"],
+        "0.1"
+    );
+    assert_eq!(
+        report["totals_by_status"]["50"]["net_movement_default_currency"],
+        "0.2"
+    );
+    assert_eq!(report["transactions"].as_array().unwrap().len(), 1);
+    assert_eq!(report["has_more"], true);
+    assert_eq!(report["next_offset"], 1);
+    assert!(report.get("closing_balance").is_none());
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *report);
+    assert!(!response.to_string().contains("fixture-access-token"));
     api.join().unwrap();
     process.shutdown();
 }
