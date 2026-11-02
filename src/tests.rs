@@ -3744,3 +3744,287 @@ async fn invoice_matches_reject_reused_ledger_ids_across_invoice_and_counterpart
     );
     server.finish();
 }
+
+fn invoice_search_args(side: &str) -> crate::invoice::SearchInvoices {
+    serde_json::from_value(json!({"account_id":COMPANY_ID,"side":side})).unwrap()
+}
+
+fn invoice_search_setup() -> Vec<Response> {
+    vec![
+        Response::json(
+            json!({"d":[{"ID":COMPANY_ID,"Division":42,"Code":" 00100 ","Name":"Company X"}]}),
+        ),
+        division_currency_response(),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_search_reads_all_pages_filters_dates_and_references_then_paginates_stably() {
+    for side in ["payable", "receivable"] {
+        for offset in [0, 1] {
+            let mut old = invoice_header(side);
+            old["EntryDate"] = json!("2025-01-01");
+            old["YourRef"] = json!("Supplier-X");
+            old["Currency"] = json!(" USD ");
+            let mut recent = old.clone();
+            recent["EntryID"] = json!("77777777-7777-7777-7777-777777777777");
+            recent["EntryNumber"] = json!(12346);
+            recent["EntryDate"] = json!("2025-12-31");
+            recent["YourRef"] = json!("SUPPLIER-X-2");
+            let mut unrelated = old.clone();
+            unrelated["EntryID"] = json!("88888888-8888-8888-8888-888888888888");
+            unrelated["YourRef"] = json!("Other");
+            let mut unknown = old.clone();
+            unknown["EntryID"] = json!("99999999-9999-9999-9999-999999999999");
+            unknown["EntryDate"] = Value::Null;
+            let mut outside = old.clone();
+            outside["EntryID"] = json!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+            outside["EntryDate"] = json!("2024-12-31");
+            let mut responses = invoice_search_setup();
+            responses.push(Response::json(
+                json!({"d":{"results":[old,unrelated,unknown],"__next":"?page=2"}}),
+            ));
+            responses.push(Response::json(json!({"d":[recent,outside]})));
+            let server = Server::new(responses);
+            let (_directory, backend) = financial_backend(&server.base).await;
+            let mut args = invoice_search_args(side);
+            args.query = Some(" supplier-x ".into());
+            args.entry_date_from = Some("2025-01-01".parse().unwrap());
+            args.entry_date_to = Some("2025-12-31".parse().unwrap());
+            args.limit = Some(1);
+            args.offset = offset;
+            let result =
+                serde_json::to_value(backend.search_invoices(args).await.unwrap()).unwrap();
+            assert_eq!(result["source_entry_count"], 5);
+            assert_eq!(result["matched_entry_count"], 2);
+            assert_eq!(result["query"], "supplier-x");
+            assert_eq!(result["default_currency"], "EUR");
+            assert_eq!(
+                result["invoices"][0]["entry_number"],
+                if offset == 0 { 12346 } else { 12345 }
+            );
+            assert_eq!(result["invoices"][0]["currency"], "USD");
+            assert_eq!(result["invoices"][0]["status_code"], 50);
+            assert!(result["invoices"][0].get("paid").is_none());
+            assert_eq!(result["has_more"], offset == 0);
+            assert_eq!(
+                result["next_offset"],
+                if offset == 0 { json!(1) } else { Value::Null }
+            );
+            let base = server.base.clone();
+            let requests = server.finish();
+            assert_eq!(requests.len(), 4);
+            let url = base
+                .join(requests[2].target.split_whitespace().nth(1).unwrap())
+                .unwrap();
+            let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(
+                parameters["$filter"],
+                format!(
+                    "{} eq guid'{COMPANY_ID}'",
+                    if side == "payable" {
+                        "Supplier"
+                    } else {
+                        "Customer"
+                    }
+                )
+            );
+            assert!(!parameters["$filter"].contains("supplier-x"));
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| r.target.starts_with("GET ") && r.body.is_empty())
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_search_uses_literal_text_exact_numeric_renderings_and_keeps_reused_accounting_numbers()
+ {
+    for (query, expected) in [
+        (Some("000123"), 1),
+        (Some("123"), 2),
+        (Some("2025001"), 1),
+        (Some("O'NEIL_%"), 1),
+        (None, 2),
+    ] {
+        let mut first = invoice_header("payable");
+        first["EntryNumber"] = json!(123);
+        first["InvoiceNumber"] = json!(2025001);
+        first["YourRef"] = json!("Supplier-000123");
+        first["Description"] = json!("Work for O'Neil_%");
+        let mut second = first.clone();
+        second["EntryID"] = json!("77777777-7777-7777-7777-777777777777");
+        second["EntryDate"] = Value::Null;
+        second["InvoiceNumber"] = json!(123);
+        second["YourRef"] = Value::Null;
+        second["Description"] = Value::Null;
+        let mut responses = invoice_search_setup();
+        responses.push(Response::json(json!({"d":[second,first]})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = invoice_search_args("payable");
+        args.query = query.map(str::to_owned);
+        let result = serde_json::to_value(backend.search_invoices(args).await.unwrap()).unwrap();
+        assert_eq!(result["matched_entry_count"], expected);
+        if query.is_none() {
+            assert_eq!(result["invoices"][0]["entry_id"], INVOICE_ENTRY_ID);
+            assert!(result["invoices"][1]["entry_date"].is_null());
+        }
+        assert_eq!(result["invoices"][0]["amount_default_currency"], "-90.0");
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_search_rejects_invalid_inputs_before_network_and_validates_excluded_source_rows() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for fields in [
+        json!({"account_id":"bad"}),
+        json!({"account_id":uuid::Uuid::nil().to_string()}),
+        json!({"query":" "}),
+        json!({"query":"x".repeat(101)}),
+        json!({"limit":0}),
+        json!({"limit":51}),
+        json!({"offset":u32::MAX}),
+        json!({"entry_date_from":"2025-02-01","entry_date_to":"2025-01-01"}),
+    ] {
+        let mut value = json!({"account_id":COMPANY_ID,"side":"payable"});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let error = backend
+            .search_invoices(serde_json::from_value(value).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(!format!("{error:#}").contains("request failed"));
+    }
+    for field in [
+        "Division",
+        "Supplier",
+        "EntryID",
+        "EntryNumber",
+        "Journal",
+        "Currency",
+    ] {
+        let mut entry = invoice_header("payable");
+        entry["Description"] = json!("not a match");
+        entry[field] = match field {
+            "Division" => json!(43),
+            "Supplier" => json!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            "EntryID" => json!(uuid::Uuid::nil().to_string()),
+            "EntryNumber" => json!(0),
+            _ => json!(" "),
+        };
+        let mut responses = invoice_search_setup();
+        responses.push(Response::json(json!({"d":[entry]})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = invoice_search_args("payable");
+        args.query = Some("missing".into());
+        assert!(backend.search_invoices(args).await.is_err());
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_search_rejects_duplicate_entries_bad_account_and_failed_pagination_without_partial_results()
+ {
+    let header = invoice_header("receivable");
+    for tail in [
+        Response::json(json!({"d":[header.clone()]})),
+        Response {
+            status: "403 Forbidden",
+            location: None,
+            body: "PRIVATE_FINANCIAL_TEXT".into(),
+        },
+    ] {
+        let mut responses = invoice_search_setup();
+        responses.push(Response::json(
+            json!({"d":{"results":[header.clone()],"__next":"?page=2"}}),
+        ));
+        responses.push(tail);
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let error = backend
+            .search_invoices(invoice_search_args("receivable"))
+            .await
+            .err()
+            .unwrap();
+        assert!(!format!("{error:#}").contains("PRIVATE_FINANCIAL_TEXT"));
+        assert_eq!(server.finish().len(), 4);
+    }
+    for account in [
+        json!([]),
+        json!([{"ID":COMPANY_ID,"Division":43,"Code":"100"}]),
+        json!([{"ID":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","Division":42,"Code":"100"}]),
+    ] {
+        let server = Server::new(vec![Response::json(json!({"d":account}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(
+            backend
+                .search_invoices(invoice_search_args("payable"))
+                .await
+                .is_err()
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invoice_search_empty_or_exhausted_pages_preserve_counts_and_do_not_imply_nonpayment() {
+    for offset in [0, 10] {
+        let mut responses = invoice_search_setup();
+        responses.push(Response::json(
+            json!({"d":if offset==0 {json!([])} else {json!([invoice_header("payable")])}}),
+        ));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = invoice_search_args("payable");
+        args.offset = offset;
+        let result = serde_json::to_value(backend.search_invoices(args).await.unwrap()).unwrap();
+        assert_eq!(result["invoices"], json!([]));
+        assert_eq!(result["matched_entry_count"], usize::from(offset > 0));
+        assert_eq!(result["has_more"], false);
+        assert!(result["next_offset"].is_null());
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_invoice_entry_uuid_disambiguates_lookup_and_must_match_the_returned_header() {
+    let server = Server::new(vec![
+        Response::json(json!({"d":[invoice_header("payable")]})),
+        division_currency_response(),
+        Response::json(json!({"d":[]})),
+    ]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let mut args = invoice_args("payable");
+    args.entry_id = Some(INVOICE_ENTRY_ID.into());
+    assert!(backend.get_invoice_details(args).await.is_ok());
+    let base = server.base.clone();
+    let requests = server.finish();
+    let url = base
+        .join(requests[0].target.split_whitespace().nth(1).unwrap())
+        .unwrap();
+    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert!(params["$filter"].contains(&format!("and EntryID eq guid'{INVOICE_ENTRY_ID}'")));
+    let server = Server::new(vec![Response::json(
+        json!({"d":[invoice_header("payable")]}),
+    )]);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let mut args = invoice_args("payable");
+    args.entry_id = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into());
+    assert!(backend.get_invoice_details(args).await.is_err());
+    assert_eq!(server.finish().len(), 1);
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for id in ["bad", "00000000-0000-0000-0000-000000000000"] {
+        let mut args = invoice_args("payable");
+        args.entry_id = Some(id.into());
+        let error = backend.get_invoice_details(args).await.err().unwrap();
+        assert!(!format!("{error:#}").contains("request failed"));
+    }
+}

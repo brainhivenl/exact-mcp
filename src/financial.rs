@@ -401,6 +401,13 @@ impl Backend {
         crate::invoice::get_details(&self.client, &self.administration, args).await
     }
 
+    pub async fn search_invoices(
+        &self,
+        args: crate::invoice::SearchInvoices,
+    ) -> Result<crate::invoice::InvoiceSearchResult> {
+        crate::invoice::search(&self.client, &self.administration, args).await
+    }
+
     pub async fn search_accounts(&self, args: SearchAccounts) -> Result<AccountSearchResult> {
         let query = args.query.trim();
         ensure!(
@@ -733,7 +740,7 @@ impl<'de> Deserialize<'de> for Money {
 }
 
 #[derive(Serialize)]
-pub(crate) struct ExactDate(NaiveDate);
+pub(crate) struct ExactDate(pub(crate) NaiveDate);
 
 impl<'de> Deserialize<'de> for ExactDate {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {

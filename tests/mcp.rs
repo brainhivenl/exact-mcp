@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 8);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -214,6 +214,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "search_invoices"
                     | "get_open_items"
                     | "get_outstanding_balances"
                     | "get_invoice_details"
@@ -864,6 +865,82 @@ fn stdio_invoice_matches_return_scoped_allocations_without_claiming_a_payment_au
     assert!(!directory.join("downloads").exists());
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_invoice_search_disambiguates_reused_numbers_for_accounting_drilldown() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let first_id = "44444444-4444-4444-4444-444444444444";
+    let second_id = "77777777-7777-7777-7777-777777777777";
+    let api = thread::spawn(move || {
+        let header = |id: &str, date: &str| json!({"EntryID":id,"Division":42,"EntryNumber":12345,"Journal":"70","Customer":ACCOUNT_ID,"Currency":"USD","EntryDate":date,"YourRef":"REF-42","AmountDC":100,"AmountFC":120,"Status":50});
+        let old = header(first_id, "2024-01-01");
+        let recent = header(second_id, "2025-01-01");
+        let responses = vec![
+            (
+                "/crm/Accounts?",
+                json!({"d":[{"ID":ACCOUNT_ID,"Division":42,"Code":" 100 ","Name":"Company X"}]}),
+            ),
+            (
+                "/system/Divisions?",
+                json!({"d":[{"Code":42,"Currency":"EUR"}]}),
+            ),
+            (
+                "/salesentry/SalesEntries?",
+                json!({"d":[old.clone(),recent]}),
+            ),
+            ("/salesentry/SalesEntries?", json!({"d":[old]})),
+            (
+                "/system/Divisions?",
+                json!({"d":[{"Code":42,"Currency":"EUR"}]}),
+            ),
+            ("/salesentry/SalesEntryLines?", json!({"d":[]})),
+        ];
+        for (index, (path, body)) in responses.into_iter().enumerate() {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"));
+            assert!(target.contains(path));
+            if index == 3 {
+                let url = reqwest::Url::parse(&format!(
+                    "http://localhost{}",
+                    target.split_whitespace().nth(1).unwrap()
+                ))
+                .unwrap();
+                let parameters: std::collections::HashMap<_, _> =
+                    url.query_pairs().into_owned().collect();
+                assert!(parameters["$filter"].contains(&format!("EntryID eq guid'{first_id}'")));
+            }
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response=process.request(2,"tools/call",json!({"name":"search_invoices","arguments":{"account_id":ACCOUNT_ID,"side":"receivable","query":"ref-42"}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["matched_entry_count"], 2);
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["invoices"][0]["entry_id"], second_id);
+    let selected = result["invoices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["entry_id"] == first_id)
+        .unwrap();
+    let details=process.request(3,"tools/call",json!({"name":"get_invoice_details","arguments":{"account_id":selected["account_id"],"entry_id":selected["entry_id"],"entry_number":selected["entry_number"],"journal_code":selected["journal_code"],"side":result["side"]}}));
+    assert_ne!(details["result"]["isError"], true, "{details}");
+    assert_eq!(
+        details["result"]["structuredContent"]["entry"]["entry_id"],
+        first_id
+    );
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    assert!(!response.to_string().contains("fixture-access-token"));
     api.join().unwrap();
     process.shutdown();
 }
