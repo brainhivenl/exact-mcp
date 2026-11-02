@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice and unprocessed commercial sales-invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations, cashflow posting drill-down, G/L period reports, booking master-data discovery, journal-period locks and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice and unprocessed commercial sales-invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations, cashflow posting drill-down, G/L period reports, booking master-data and article discovery, supplier/customer booking context, journal-period locks and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
 
 ## Setup
 
@@ -13,7 +13,7 @@ Use Nix with flakes enabled, or Rust 1.89 or newer.
    https://exact-mcp.localhost:8400/callback
    ```
 
-3. Make sure the authorizing user/app has access to the administrations you need. Booking master-data tools may additionally require **Financial cashflow**, **Financial costcenters** or **Projects projects** and the corresponding package; see the booking master-data table. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries. Invoice accounting drill-down additionally requires **Financial accounting**; it also uses **Organization administration** to resolve the default currency. Existing outstanding-balance tools do not require the additional accounting scope. PDF discovery/download also requires **Organization documents**, and receivable PDF discovery additionally uses **Sales invoices** to resolve the original commercial invoice UUID. Payment drill-down and G/L lookup/reporting additionally require **Financial generalledgers** for journal or chart metadata. G/L reports also use **Financial accounting** and **Organization administration**. Existing invoice/matching/company-search tools do not need the extra generalledgers scope.
+3. Make sure the authorizing user/app has access to the administrations you need. Booking master-data tools may additionally require **Financial cashflow**, **Financial costcenters**, **Projects projects** or **Logistics items** and the corresponding package; see the booking master-data table. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries. Invoice accounting drill-down additionally requires **Financial accounting**; it also uses **Organization administration** to resolve the default currency. Existing outstanding-balance tools do not require the additional accounting scope. PDF discovery/download also requires **Organization documents**, and receivable PDF discovery additionally uses **Sales invoices** to resolve the original commercial invoice UUID. Payment drill-down and G/L lookup/reporting additionally require **Financial generalledgers** for journal or chart metadata. G/L reports also use **Financial accounting** and **Organization administration**. Existing invoice/matching/company-search tools do not need the extra generalledgers scope.
 4. With Nix, run the CLI directly (the first invocation builds it):
 
    ```sh
@@ -80,7 +80,7 @@ nix run .#pi
 
 This builds the MCP binary, loads credentials from the environment or the repository's `.env`, registers its exact Nix store path as the project-local `exact` server with direct tool exposure, and starts a fresh interactive Pi session. The secret is inherited through the process environment, not saved in the MCP configuration or requested again at a prompt. Existing Pi credentials, models and user-level configuration are reused unchanged.
 
-The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with twenty-two tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
+The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with twenty-seven tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
 
 ### Other MCP clients
 
@@ -166,6 +166,42 @@ Blocked/expired records remain visible. `null` restrictions are unknown, never i
 A GET-only live MCP smoke check on 2026-11-02 advertised all twenty-two tools and successfully read 17 VAT codes with rate history, 11 payment conditions, eight journals, one cost centre, an empty cost-unit catalog and twelve current-year period dates. A uniquely identified purchase journal returned twelve open journal-period states with no missing calendar dates or orphan status rows. This checks live API paths/field selection and response handling, **not independent browser reconciliation, historical VAT selection or booking eligibility**. `search_projects` returned HTTP 403 for the selected account/package; nonempty project retrieval remains live-unverified. No permissions, subscriptions or financial records were changed. Raw evidence remains private outside the repository; MCP stderr was empty and shutdown clean.
 
 Invented local fixtures additionally cover all eight tools over MCP, paginated catalogs and VAT histories, hidden invalid rows, duplicate/wrong-scope identities, exact padded codes, literal Unicode queries, raw numeric precision, nulls, blocked/expired records, empty/exhausted windows, failed later pages, noncalendar/special periods, missing/unknown locks and explicit lock rows without calendar dates. Live closed/missing/unknown lock cases and nonempty cost units/projects were not available or verified in this check.
+
+### Articles and supplier/customer booking context
+
+Five more GET-only tools cover **artikelen** (items/products/services), units, explicit supplier-item links and current company defaults:
+
+| Tool | Example | Permission |
+| --- | --- | --- |
+| `search_items` | `{ "query": "001", "match_by": "code" }` | **Logistics items** and package access |
+| `get_item_details` | `{ "item_id": "<selected item UUID>" }` | **Logistics items** and package access |
+| `search_units` | `{}` | **Logistics items** and package access |
+| `search_supplier_items` | `{ "account_id": "<verified supplier UUID>" }` | **Crm accounts**, **Logistics items** and package access |
+| `get_account_booking_context` | `{ "account_id": "<verified company UUID>" }` | **Crm accounts** |
+
+`search_items` and `search_units` use the same optional query, exact-code matching and pagination arguments as other master-data searches. Inactive records remain visible. All source pages, including excluded records, are scope/identity/duplicate checked before filtering and stable code/UUID pagination. Clarify ambiguous articles before selecting one for a business action. `get_item_details` accepts the explicitly selected UUID from item search, supplier links or a verified commercial invoice line. It reads a unique item and only its explicit `ItemGroup` reference, validating both identities/administrations and any reported group code. A missing group stays `null`; missing/ambiguous referenced groups or failed sources return an error, not partial details or a guessed default group.
+
+**Item defaults are not a final posting decision.** Item activity is represented by `StartDate`/`EndDate`; the documented Items endpoint has no generic `IsBlocked` field. Purchase/sales, fractional-quantity, stock and taxable flags retain source values/nulls without a fabricated `booking_allowed` flag. Item cost/revenue G/L overrides remain separate from group defaults. In particular, **item `GLCosts` is not automatically the purchase-invoice account**: group `GLPurchaseAccount` has inventory-method-specific semantics. No effective G/L inheritance or precedence across company/item/group settings is inferred. Referenced G/L/VAT codes have not been revalidated for a proposed booking.
+
+Item `SalesVatCode` is a sales default; purchase VAT is available on supplier-item links, not an invented item purchase-VAT field. Prices, quantities and factors remain raw numeric strings. `StandardSalesPrice` is not a customer/date/quantity-specific quote, and its currency is not established by the Items reference: detail results explicitly return `standard_sales_price_currency: null`. `CostPriceStandard` uses `CostPriceCurrency` and is **not** the supplier purchase price. Customer price lists, historical price lists, discounts and unit conversions are not resolved into a final price.
+
+`search_units` returns UUIDs/codes and source `Active`, `Main`, `Type` and `TimeUnit` metadata. Item `Unit` and supplier `PurchaseUnit` are **codes**, while supplier `ItemUnit` is a **UUID**. Do not interchange them or treat the default-unit flag as a conversion factor.
+
+`search_supplier_items` revalidates the selected company. Optional `item_id` additionally revalidates a selected item; omit it to discover that supplier's links. Optional `supplier_item_code` is an **exact supplier article reference**, ignoring surrounding padding while preserving case/leading zeroes; it is not an internal item code or description search. Optional `limit` (default 10, max 50) and `offset` paginate stable item-code/supplier-reference/UUID order after all scoped source pages have been read. Results include `source_link_count`, `matched_link_count`, `links`, `has_more` and `next_offset`. Wrong supplier/item associations, duplicate UUIDs, inconsistent selected item codes and reversed dates fail the whole request, even for locally excluded links.
+
+Supplier links expose purchase price/currency, price dates, VAT, units/factor, minimum quantity and `MainSupplier` without automatically selecting a link. **Exact documents SupplierItem as returning active/future prices only, not full history; `PurchasePrice=0` can mean no active/future price exists, not free goods.** Future prices must not be assumed current. An empty result is only empty for this provider source/selection. Missing permissions/package support is an error, not an empty catalog. Raw currency/unit differences and nulls stay explicit; no conversion is performed.
+
+Resolve a company with `search_accounts` or `get_outstanding_balances`, then use `get_account_booking_context` for its source country, VAT/registration identifiers, blocked/activity/role flags and separate purchase/sales G/L, VAT, payment-condition, currency and discount defaults. Corporate offset accounts (`GLAccountPurchase`/`GLAccountSales`) are distinct from AP/AR control accounts (`GLAP`/`GLAR`). Defaults and price-list references are not followed or revalidated into booking approval. Discounts are raw fractions (0.055 means 5.5%). `SalesCurrency` is documented for Time & Billing; CRM `Status` is not paid/unpaid. `VATLiability` is Belgium VAT-debtor-listing metadata, not an automatic tax treatment. Source registration/VAT numbers are not externally verified identities. `InvoiceAccount` remains an explicit reference and is never silently substituted for the selected company. No bank-account, street-address, contact or citizen-service-number fields are requested.
+
+All results are current source reads, not historical invoice terms or a frozen snapshot. Unknown restrictions stay unknown. Source text/identifiers are potentially sensitive untrusted data, never instructions. No article, company, supplier link, price or financial entry is created or changed.
+
+#### Article/context validation and master-data recheck
+
+On 2026-11-02, the rebuilt server advertised all twenty-seven tools. Fresh GET-only checks again read VAT/rate history, payment conditions, journals, cost centres/units and period/lock data successfully; all twelve sampled current-year purchase-journal periods were open. Projects still returned HTTP 403 and cost units were still empty.
+
+The new paths read all sixteen article headers and all five units, returned a selected article and its linked group with matching identity, and round-tripped that article's exact code to one matching UUID. A company explicitly selected from the current payable report was revalidated by UUID for its booking context. **SupplierItem returned HTTP 403 for this account/package**, so nonempty supplier-item retrieval and supplier-to-item drill-down remain live-unverified. Permissions/package settings were not changed to obtain coverage. This is a live API/MCP smoke check, not independent browser reconciliation or evidence that a proposed booking/price is valid. Stderr was empty and shutdown clean; raw responses/identifiers remain private outside the repository.
+
+Invented local fixtures cover all five tools over MCP, item/group provenance, missing/ambiguous/wrong-scope references, excluded invalid dates, inactive/unknown flags, raw price/discount precision, separate company defaults and bill-to references, explicit supplier associations, exact supplier references, complete paginated link counts, future/zero/null prices, currency/unit distinctions and safe errors without partial results. An existing CLI mock now makes accepted sockets blocking before reading requests, matching the other test servers and fixing the reproduced macOS `WouldBlock` test race.
 
 ### Administration-wide balances
 
@@ -457,7 +493,7 @@ There is no persistent cache, financial export checkpoint, snapshot token or new
 
 ## Checks
 
-Additional regressions cover 429 retry bounds/reset hints, cancellation and scope changes during retry sleeps, no-retry token exchanges, streamed page failures, large sorted result windows, and read-only commercial invoice search/details over statuses 10/20 with bill-to identity checks. MCP subprocess discovery checks all twenty-two tools and exercises draft and reconstructed bank-queue workflows separately from accounting invoices.
+Additional regressions cover 429 retry bounds/reset hints, cancellation and scope changes during retry sleeps, no-retry token exchanges, streamed page failures, large sorted result windows, and read-only commercial invoice search/details over statuses 10/20 with bill-to identity checks. MCP subprocess discovery checks all twenty-seven tools and exercises draft and reconstructed bank-queue workflows separately from accounting invoices.
 
 ```sh
 cargo fmt --check
@@ -494,3 +530,8 @@ Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with tempo
 - [Exact: cost centres](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=HRMCostcenters)
 - [Exact: cost units](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=HRMCostunits)
 - [Exact: projects](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ProjectProjects)
+
+- [Exact: articles/items](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=LogisticsItems)
+- [Exact: item-group accounting defaults](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=LogisticsItemGroups)
+- [Exact: supplier-item links and prices](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=LogisticsSupplierItem)
+- [Exact: article units](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=LogisticsUnits)

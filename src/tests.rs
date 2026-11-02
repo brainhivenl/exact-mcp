@@ -5074,3 +5074,6 @@ async fn concurrent_bank_configuration_updates_preserve_other_scopes() {
 
 #[path = "master_data/tests.rs"]
 mod master_data_tests;
+
+#[path = "master_data/items_tests.rs"]
+mod item_context_tests;

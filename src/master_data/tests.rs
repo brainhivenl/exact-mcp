@@ -5,8 +5,15 @@ use reqwest::Url;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-const CATALOGS: [&str; 6] = [
-    "vat", "journals", "payments", "centers", "units", "projects",
+const CATALOGS: [&str; 8] = [
+    "vat",
+    "journals",
+    "payments",
+    "centers",
+    "units",
+    "projects",
+    "items",
+    "article_units",
 ];
 
 fn record(id: u128, code: &str) -> Value {
@@ -44,6 +51,8 @@ async fn call(backend: &Backend, resource: &str, args: Value) -> Result<Value> {
         "centers" => serde_json::to_value(backend.search_cost_centers(args).await?)?,
         "units" => serde_json::to_value(backend.search_cost_units(args).await?)?,
         "projects" => serde_json::to_value(backend.search_projects(args).await?)?,
+        "items" => serde_json::to_value(backend.search_items(args).await?)?,
+        "article_units" => serde_json::to_value(backend.search_units(args).await?)?,
         _ => unreachable!(),
     };
     Ok(result)

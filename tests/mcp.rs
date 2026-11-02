@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 27);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -214,6 +214,11 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "search_items"
+                    | "get_item_details"
+                    | "search_units"
+                    | "search_supplier_items"
+                    | "get_account_booking_context"
                     | "search_vat_codes"
                     | "search_journals"
                     | "search_payment_conditions"
@@ -239,6 +244,8 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
         ));
     }
     for name in [
+        "search_items",
+        "search_units",
         "search_vat_codes",
         "search_journals",
         "search_payment_conditions",
@@ -255,6 +262,20 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             !schema["required"]
                 .as_array()
                 .is_some_and(|required| required.contains(&json!("query")))
+        );
+    }
+    for (name, required) in [
+        ("get_item_details", "item_id"),
+        ("search_supplier_items", "account_id"),
+        ("get_account_booking_context", "account_id"),
+    ] {
+        let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required))
         );
     }
     let lock_schema = &tools
@@ -1531,6 +1552,105 @@ fn stdio_booking_master_data_and_journal_locks_are_read_only() {
         json!({"name":"search_vat_codes","arguments":{"limit":0}}),
     );
     assert_eq!(response["result"]["isError"], true);
+    api.join().unwrap();
+    process.shutdown();
+    assert!(!directory.join("downloads").exists());
+}
+
+#[test]
+fn stdio_article_and_account_context_preserve_source_defaults_without_booking() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let item_id = "22222222-2222-2222-2222-222222222222";
+    let group_id = "33333333-3333-3333-3333-333333333333";
+    let unit_id = "44444444-4444-4444-4444-444444444444";
+    let api = thread::spawn(move || {
+        let item = json!({"ID":item_id,"Division":42,"Code":" 001 ","Description":"Invented article","ItemGroup":group_id,"ItemGroupCode":"G1","GLCosts":ACCOUNT_ID,"StandardSalesPrice":0.1,"CostPriceStandard":0.2,"CostPriceCurrency":"USD","Unit":"pc","IsPurchaseItem":true});
+        let account = json!({"ID":ACCOUNT_ID,"Division":42,"Code":" 0001 ","Name":"Invented supplier","Blocked":true,"IsSupplier":true,"GLAccountPurchase":unit_id,"GLAP":item_id,"PurchaseVATCode":"P1","DiscountPurchase":0.055});
+        let responses = [
+            ("/logistics/Items?", json!({"d":[item.clone()]})),
+            ("/logistics/Items?", json!({"d":[item.clone()]})),
+            (
+                "/logistics/ItemGroups?",
+                json!({"d":[{"ID":group_id,"Division":42,"Code":"G1","GLPurchaseAccount":unit_id}]}),
+            ),
+            (
+                "/logistics/Units?",
+                json!({"d":[{"ID":unit_id,"Division":42,"Code":"pc","Description":"Piece","Active":false,"Main":1,"Type":"O"}]}),
+            ),
+            ("/crm/Accounts?", json!({"d":[account.clone()]})),
+            ("/crm/Accounts?", json!({"d":[account]})),
+            ("/logistics/Items?", json!({"d":[item]})),
+            (
+                "/logistics/SupplierItem?",
+                json!({"d":[{"ID":group_id,"Division":42,"Supplier":ACCOUNT_ID,"Item":item_id,"ItemCode":"001","SupplierItemCode":" 000REF ","PurchasePrice":0,"Currency":"CHF","PurchaseUnit":"box","PurchaseUnitFactor":12,"ItemUnit":unit_id,"PurchaseVATCode":"P1","StartDate":"2099-01-01"}]}),
+            ),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"));
+            assert!(target.contains(path), "{target}");
+            for forbidden in ["BankAccounts", "BSN", "AddressLine1", "Email", "Phone"] {
+                assert!(!target.contains(forbidden));
+            }
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let calls = [
+        ("search_items", json!({"query":"001","match_by":"code"})),
+        ("get_item_details", json!({"item_id":item_id})),
+        ("search_units", json!({})),
+        (
+            "get_account_booking_context",
+            json!({"account_id":ACCOUNT_ID}),
+        ),
+        (
+            "search_supplier_items",
+            json!({"account_id":ACCOUNT_ID,"item_id":item_id,"supplier_item_code":"000REF"}),
+        ),
+    ];
+    for (index, (name, args)) in calls.into_iter().enumerate() {
+        let response = process.request(
+            index as u32 + 2,
+            "tools/call",
+            json!({"name":name,"arguments":args}),
+        );
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let result = &response["result"]["structuredContent"];
+        assert_eq!(result["administration"]["Code"], 42);
+        match name {
+            "search_items" => assert_eq!(result["records"][0]["standard_sales_price"], "0.1"),
+            "get_item_details" => {
+                assert_eq!(result["item"]["gl_costs_id"], ACCOUNT_ID);
+                assert_eq!(result["item_group"]["gl_purchase_account_id"], unit_id);
+                assert!(result["standard_sales_price_currency"].is_null());
+            }
+            "search_units" => assert_eq!(result["records"][0]["active"], false),
+            "get_account_booking_context" => {
+                assert_eq!(result["account"]["is_blocked"], true);
+                assert_eq!(result["account"]["discount_purchase"], "0.055");
+                assert_eq!(result["account"]["gl_account_purchase_id"], unit_id);
+                assert_eq!(result["account"]["gl_accounts_payable_id"], item_id);
+            }
+            _ => {
+                assert_eq!(result["links"][0]["purchase_price"], "0");
+                assert_eq!(result["links"][0]["currency"], "CHF");
+                assert_eq!(result["links"][0]["purchase_unit_factor"], "12");
+                assert_eq!(result["links"][0]["start_date"], "2099-01-01");
+                assert_eq!(result["matched_link_count"], 1);
+            }
+        }
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+        assert!(!response.to_string().contains("fixture-access-token"));
+        assert!(result.get("booking_allowed").is_none());
+    }
+    let invalid=process.request(10,"tools/call",json!({"name":"get_account_booking_context","arguments":{"account_id":"00000000-0000-0000-0000-000000000000"}}));
+    assert_eq!(invalid["result"]["isError"], true);
     api.join().unwrap();
     process.shutdown();
     assert!(!directory.join("downloads").exists());

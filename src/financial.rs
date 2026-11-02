@@ -401,6 +401,41 @@ impl Backend {
         crate::draft::get_details(&self.client, &self.administration, args).await
     }
 
+    pub async fn search_items(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::Item>> {
+        crate::master_data::search_items(&self.client, &self.administration, args).await
+    }
+
+    pub async fn search_units(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::Unit>> {
+        crate::master_data::search_units(&self.client, &self.administration, args).await
+    }
+
+    pub async fn get_item_details(
+        &self,
+        args: crate::master_data::GetItemDetails,
+    ) -> Result<crate::master_data::ItemDetails> {
+        crate::master_data::get_item_details(&self.client, &self.administration, args).await
+    }
+
+    pub async fn search_supplier_items(
+        &self,
+        args: crate::master_data::SearchSupplierItems,
+    ) -> Result<crate::master_data::SupplierItemsResult> {
+        crate::master_data::search_supplier_items(&self.client, &self.administration, args).await
+    }
+
+    pub async fn get_account_booking_context(
+        &self,
+        args: crate::account_context::GetAccountBookingContext,
+    ) -> Result<crate::account_context::AccountBookingContext> {
+        crate::account_context::get_context(&self.client, &self.administration, args).await
+    }
+
     pub async fn search_vat_codes(
         &self,
         args: crate::master_data::SearchMasterData,
