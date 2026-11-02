@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::exact::ExactClient;
 use crate::financial::{ExactDate, Money, deserialize_report_id};
 use crate::invoice;
-use crate::store::Administration;
+use crate::store::{Administration, BankConfiguration};
 
 #[cfg(test)]
 mod tests;
@@ -25,9 +25,9 @@ const BATCH_SIZE: usize = 20;
 #[serde(deny_unknown_fields)]
 pub struct GetBankTransactionsToHandle {
     #[schemars(
-        description = "Required 1–10 verified G/L UUIDs selected with search_gl_accounts and explicitly confirmed as unassigned-bank allocation accounts. No automatic code/name/type inference."
+        description = "Optional 1–10 verified G/L UUIDs explicitly confirmed as unassigned-bank allocation accounts. Omit to use saved settings for the selected administration; an explicit list overrides settings for this call without saving. Empty lists are invalid. No automatic code/name/type inference."
     )]
-    pub unassigned_gl_account_ids: Vec<String>,
+    pub unassigned_gl_account_ids: Option<Vec<String>>,
     #[schemars(
         description = "Optional verified bank/payment-service journal code; checked against current journals of Type 12 or 16."
     )]
@@ -51,18 +51,7 @@ pub struct GetBankTransactionsToHandle {
 }
 
 impl GetBankTransactionsToHandle {
-    fn validate(&self) -> Result<BTreeSet<Uuid>> {
-        ensure!(
-            (1..=10).contains(&self.unassigned_gl_account_ids.len()),
-            "Select 1–10 verified unassigned G/L UUIDs"
-        );
-        let mut ids = BTreeSet::new();
-        for value in &self.unassigned_gl_account_ids {
-            let id = Uuid::parse_str(value)
-                .context("unassigned_gl_account_ids must contain G/L UUIDs")?;
-            ensure!(!id.is_nil(), "Unassigned G/L UUID must not be nil");
-            ensure!(ids.insert(id), "Duplicate unassigned G/L UUID selection");
-        }
+    fn validate(&self) -> Result<Option<BankConfiguration>> {
         ensure!(
             (1..=100).contains(&self.limit.unwrap_or(50)),
             "Bank transaction limit must be between 1 and 100"
@@ -82,7 +71,10 @@ impl GetBankTransactionsToHandle {
                 "transaction_date_from must not be after transaction_date_to"
             );
         }
-        Ok(ids)
+        self.unassigned_gl_account_ids
+            .as_deref()
+            .map(BankConfiguration::from_argument_ids)
+            .transpose()
     }
 
     fn matches_date(&self, date: Option<&ExactDate>) -> bool {
@@ -91,6 +83,33 @@ impl GetBankTransactionsToHandle {
             && self
                 .transaction_date_to
                 .is_none_or(|to| date.is_some_and(|date| date.0 <= to))
+    }
+}
+
+impl BankConfiguration {
+    fn from_argument_ids(values: &[String]) -> Result<Self> {
+        let configuration = Self {
+            unassigned_gl_account_ids: values
+                .iter()
+                .map(|value| {
+                    Uuid::parse_str(value)
+                        .context("unassigned_gl_account_ids must contain G/L UUIDs")
+                })
+                .collect::<Result<_>>()?,
+        };
+        configuration.validate()?;
+        Ok(configuration)
+    }
+}
+
+impl Administration {
+    async fn validate_bank_scope(&self, client: &ExactClient) -> Result<()> {
+        let session = client.session().await?;
+        ensure!(
+            session.administration.as_ref().map(|item| item.code) == Some(self.code),
+            "Bank queue administration differs from the selected session"
+        );
+        Ok(())
     }
 }
 
@@ -135,11 +154,17 @@ struct GlAccount {
 }
 
 impl GlAccount {
-    fn validate_for(&self, division: u32, selected: &BTreeSet<Uuid>) -> Result<()> {
+    fn validate_for(
+        &self,
+        division: u32,
+        selected: &BTreeSet<Uuid>,
+        include_outstanding: bool,
+    ) -> Result<()> {
         ensure!(
             self.division == division
                 && !self.id.is_nil()
-                && (selected.contains(&self.id) || matches!(self.type_code, Some(20 | 22))),
+                && (selected.contains(&self.id)
+                    || (include_outstanding && matches!(self.type_code, Some(20 | 22)))),
             "Invalid or wrong-scope G/L metadata; no queue returned"
         );
         Ok(())
@@ -422,6 +447,7 @@ pub struct BankTransactionsToHandle {
     retrieved_at: String,
     default_currency: String,
     amount_basis: &'static str,
+    configuration_source: &'static str,
     unassigned_gl_accounts: Vec<GlAccount>,
     journals: Vec<Journal>,
     transaction_date_from: Option<NaiveDate>,
@@ -470,80 +496,133 @@ fn id_filter(field: &str, ids: impl IntoIterator<Item = Uuid>) -> String {
     )
 }
 
+struct BankScope {
+    journals: BTreeMap<String, Journal>,
+    gl_accounts: BTreeMap<Uuid, GlAccount>,
+}
+
+impl BankScope {
+    async fn load(
+        client: &ExactClient,
+        administration: &Administration,
+        selected: &BTreeSet<Uuid>,
+        journal_code: Option<&str>,
+        include_outstanding: bool,
+    ) -> Result<Self> {
+        administration.validate_bank_scope(client).await?;
+        let root = client
+            .base_url()
+            .join(&format!("/api/v1/{}/", administration.code))?;
+        let all_journals: Vec<Journal> = client
+            .get_collection(collection_url(
+                &root,
+                "financial/Journals",
+                JOURNAL_FIELDS,
+                Some("(Type eq 12 or Type eq 16) and GLAccount ne null"),
+            )?)
+            .await?;
+        let mut journals = BTreeMap::new();
+        let mut journal_ids = HashSet::new();
+        let mut control_gl_ids = HashSet::new();
+        for journal in all_journals {
+            journal.validate(administration.code)?;
+            ensure!(
+                journal_ids.insert(journal.id),
+                "Duplicate bank journal UUID; no queue returned"
+            );
+            control_gl_ids.insert(journal.gl_account_id);
+            let code = journal.code.trim().to_owned();
+            ensure!(
+                journals.insert(code, journal).is_none(),
+                "Duplicate bank journal code; no queue returned"
+            );
+        }
+        ensure!(
+            selected.iter().all(|id| !control_gl_ids.contains(id)),
+            "Selected unassigned G/L is an own-bank control G/L"
+        );
+        if let Some(code) = journal_code {
+            ensure!(
+                journals.contains_key(code.trim()),
+                "Selected journal is not a verified bank/payment-service journal"
+            );
+            journals.retain(|key, _| key == code.trim());
+        }
+        let mut gl_filter = id_filter("ID", selected.iter().copied());
+        if include_outstanding {
+            gl_filter.push_str(" or Type eq 20 or Type eq 22");
+        }
+        let accounts: Vec<GlAccount> = client
+            .get_collection(collection_url(
+                &root,
+                "financial/GLAccounts",
+                GL_FIELDS,
+                Some(&gl_filter),
+            )?)
+            .await?;
+        let mut gl_accounts = BTreeMap::new();
+        for account in accounts {
+            account.validate_for(administration.code, selected, include_outstanding)?;
+            ensure!(
+                gl_accounts.insert(account.id, account).is_none(),
+                "Duplicate G/L metadata; no queue returned"
+            );
+        }
+        ensure!(
+            selected.iter().all(|id| gl_accounts.contains_key(id)),
+            "Selected unassigned G/L metadata is missing; no queue returned"
+        );
+        administration.validate_bank_scope(client).await?;
+        Ok(Self {
+            journals,
+            gl_accounts,
+        })
+    }
+}
+
+pub(crate) async fn validate_configuration(
+    client: &ExactClient,
+    administration: &Administration,
+    unassigned_gl_account_ids: Vec<String>,
+) -> Result<BankConfiguration> {
+    let configuration = BankConfiguration::from_argument_ids(&unassigned_gl_account_ids)?;
+    let selected = configuration.validate()?;
+    BankScope::load(client, administration, &selected, None, false).await?;
+    Ok(configuration)
+}
+
 pub(crate) async fn get_transactions_to_handle(
     client: &ExactClient,
     administration: &Administration,
     args: GetBankTransactionsToHandle,
 ) -> Result<BankTransactionsToHandle> {
-    let selected = args.validate()?;
-    let session = client.session().await?;
-    ensure!(
-        session.administration.as_ref().map(|item| item.code) == Some(administration.code),
-        "Bank queue administration differs from the selected session"
-    );
+    let explicit_configuration = args.validate()?;
+    administration.validate_bank_scope(client).await?;
+    let (configuration, configuration_source) = match explicit_configuration {
+        Some(configuration) => (configuration, "arguments"),
+        None => (
+            client.bank_configuration().await?.context(
+                "No unassigned bank G/L settings for the selected administration; run `exact-mcp bank-config set --unassigned-gl-account-id <UUID>` or pass unassigned_gl_account_ids",
+            )?,
+            "saved_administration",
+        ),
+    };
+    let selected = configuration.validate()?;
     let root = client
         .base_url()
         .join(&format!("/api/v1/{}/", administration.code))?;
     let default_currency = invoice::default_currency(client, administration).await?;
-    let all_journals: Vec<Journal> = client
-        .get_collection(collection_url(
-            &root,
-            "financial/Journals",
-            JOURNAL_FIELDS,
-            Some("(Type eq 12 or Type eq 16) and GLAccount ne null"),
-        )?)
-        .await?;
-    let mut journals = BTreeMap::new();
-    let mut journal_ids = HashSet::new();
-    let mut control_gl_ids = HashSet::new();
-    for journal in all_journals {
-        journal.validate(administration.code)?;
-        ensure!(
-            journal_ids.insert(journal.id),
-            "Duplicate bank journal UUID; no queue returned"
-        );
-        control_gl_ids.insert(journal.gl_account_id);
-        let code = journal.code.trim().to_owned();
-        ensure!(
-            journals.insert(code, journal).is_none(),
-            "Duplicate bank journal code; no queue returned"
-        );
-    }
-    ensure!(
-        selected.iter().all(|id| !control_gl_ids.contains(id)),
-        "Selected unassigned G/L is an own-bank control G/L"
-    );
-    if let Some(code) = &args.journal_code {
-        ensure!(
-            journals.contains_key(code.trim()),
-            "Selected journal is not a verified bank/payment-service journal"
-        );
-        journals.retain(|key, _| key == code.trim());
-    }
-    let gl_filter = format!(
-        "{} or Type eq 20 or Type eq 22",
-        id_filter("ID", selected.iter().copied())
-    );
-    let accounts: Vec<GlAccount> = client
-        .get_collection(collection_url(
-            &root,
-            "financial/GLAccounts",
-            GL_FIELDS,
-            Some(&gl_filter),
-        )?)
-        .await?;
-    let mut gl_accounts = BTreeMap::new();
-    for account in accounts {
-        account.validate_for(administration.code, &selected)?;
-        ensure!(
-            gl_accounts.insert(account.id, account).is_none(),
-            "Duplicate G/L metadata; no queue returned"
-        );
-    }
-    ensure!(
-        selected.iter().all(|id| gl_accounts.contains_key(id)),
-        "Selected unassigned G/L metadata is missing; no queue returned"
-    );
+    let BankScope {
+        journals,
+        gl_accounts,
+    } = BankScope::load(
+        client,
+        administration,
+        &selected,
+        args.journal_code.as_deref(),
+        true,
+    )
+    .await?;
     let mut evidence = Vec::new();
     let mut unassigned_ids = HashSet::new();
     if !journals.is_empty() {
@@ -845,12 +924,13 @@ pub(crate) async fn get_transactions_to_handle(
         .skip(args.offset as usize)
         .take(args.limit.unwrap_or(50) as usize)
         .collect();
-    client.session().await?;
+    administration.validate_bank_scope(client).await?;
     Ok(BankTransactionsToHandle {
         administration: administration.clone(),
         retrieved_at: Utc::now().to_rfc3339(),
         default_currency,
         amount_basis: "signed_bank_control_postings_not_settlement_or_outstanding_amounts",
+        configuration_source,
         unassigned_gl_accounts: gl_accounts
             .into_values()
             .filter(|gl| selected.contains(&gl.id))

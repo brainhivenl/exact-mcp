@@ -4773,3 +4773,301 @@ async fn large_invoice_search_counts_all_pages_and_retains_correct_latest_window
     assert_eq!(result["next_offset"], 103);
     assert_eq!(server.finish().len(), 22);
 }
+
+fn bank_configuration(value: u128) -> crate::store::BankConfiguration {
+    crate::store::BankConfiguration {
+        unassigned_gl_account_ids: vec![uuid::Uuid::from_u128(value)],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bank_configuration_storage_scopes_replacement_and_clear_without_touching_tokens() {
+    let directory = tempdir().unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let initial = session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+    store.save(&initial).await.unwrap();
+    let session_path = directory.path().join("session.json");
+    let session_bytes = fs::read(&session_path).unwrap();
+    let config_path = directory.path().join("bank-config.json");
+    assert!(store.bank_configuration(&initial).await.unwrap().is_none());
+    assert!(!store.clear_bank_configuration(&initial).await.unwrap());
+    assert!(!config_path.exists());
+    let mut other_administration = initial.clone();
+    other_administration.administration.as_mut().unwrap().code = 43;
+    let mut other_origin = initial.clone();
+    other_origin.base_url = "https://other.example/".into();
+    let mut other_app = initial.clone();
+    other_app.client_id = "other-client".into();
+    for (index, scope) in [&initial, &other_administration, &other_origin, &other_app]
+        .into_iter()
+        .enumerate()
+    {
+        store
+            .save_bank_configuration(scope, bank_configuration(index as u128 + 1))
+            .await
+            .unwrap();
+    }
+    for (index, scope) in [&initial, &other_administration, &other_origin, &other_app]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            store.bank_configuration(scope).await.unwrap(),
+            Some(bank_configuration(index as u128 + 1))
+        );
+    }
+    store
+        .save_bank_configuration(&initial, bank_configuration(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.bank_configuration(&initial).await.unwrap(),
+        Some(bank_configuration(5))
+    );
+    assert!(
+        store
+            .clear_bank_configuration(&other_administration)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .clear_bank_configuration(&other_administration)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.bank_configuration(&other_origin).await.unwrap(),
+        Some(bank_configuration(3))
+    );
+    assert_eq!(
+        store.bank_configuration(&other_app).await.unwrap(),
+        Some(bank_configuration(4))
+    );
+    assert_eq!(fs::read(session_path).unwrap(), session_bytes);
+    let json = fs::read_to_string(&config_path).unwrap();
+    assert!(!json.contains("access_token"));
+    assert!(!json.contains("refresh_token"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&json)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_bank_configuration_never_overwrites_existing_settings() {
+    let directory = tempdir().unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let scope = session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+    store
+        .save_bank_configuration(&scope, bank_configuration(1))
+        .await
+        .unwrap();
+    let path = directory.path().join("bank-config.json");
+    let original = fs::read(&path).unwrap();
+    for ids in [
+        vec![],
+        vec![uuid::Uuid::nil()],
+        vec![uuid::Uuid::from_u128(1); 2],
+        (1..=11).map(uuid::Uuid::from_u128).collect(),
+    ] {
+        assert!(
+            store
+                .save_bank_configuration(
+                    &scope,
+                    crate::store::BankConfiguration {
+                        unassigned_gl_account_ids: ids
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    let mut unselected = scope.clone();
+    unselected.administration = None;
+    assert!(store.bank_configuration(&unselected).await.is_err());
+    assert!(
+        store
+            .save_bank_configuration(&unselected, bank_configuration(2))
+            .await
+            .is_err()
+    );
+    assert!(store.clear_bank_configuration(&unselected).await.is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let entry: Value = serde_json::from_slice(&original).unwrap();
+    for contents in [
+        "PRIVATE_LOCAL_SECRET".to_owned(),
+        json!([entry[0], entry[0]]).to_string(),
+        json!([{"scope":entry[0]["scope"],"configuration":{"unassigned_gl_account_ids":[]}}])
+            .to_string(),
+    ] {
+        fs::write(&path, &contents).unwrap();
+        let error = store.bank_configuration(&scope).await.unwrap_err();
+        assert!(!format!("{error:#}").contains("PRIVATE_LOCAL_SECRET"));
+        assert!(
+            store
+                .save_bank_configuration(&scope, bank_configuration(3))
+                .await
+                .is_err()
+        );
+        assert!(store.clear_bank_configuration(&scope).await.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bank_configuration_rejects_symlinks_and_public_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let directory = tempdir().unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let scope = session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+    let path = directory.path().join("bank-config.json");
+    let target = directory.path().join("private-target.json");
+    fs::write(&target, "[]\n").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&target, &path).unwrap();
+    assert!(store.bank_configuration(&scope).await.is_err());
+    assert!(
+        store
+            .save_bank_configuration(&scope, bank_configuration(1))
+            .await
+            .is_err()
+    );
+    assert!(store.clear_bank_configuration(&scope).await.is_err());
+    assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "[]\n");
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, "[]\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(store.bank_configuration(&scope).await.is_err());
+    assert!(
+        store
+            .save_bank_configuration(&scope, bank_configuration(1))
+            .await
+            .is_err()
+    );
+    assert!(store.clear_bank_configuration(&scope).await.is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), "[]\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bank_configuration_client_requires_pinned_scope_and_preserves_rotated_tokens() {
+    let directory = tempdir().unwrap();
+    let initial = session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+    {
+        let store = Store::open(directory.path()).await.unwrap();
+        store.save(&initial).await.unwrap();
+    }
+    let mut exact = exact::ExactClient::new(directory.path().into(), client(), None)
+        .await
+        .unwrap();
+    assert!(exact.bank_configuration().await.is_err());
+    assert!(
+        exact
+            .save_bank_configuration(bank_configuration(1))
+            .await
+            .is_err()
+    );
+    assert!(exact.clear_bank_configuration().await.is_err());
+    exact.pin_administration().unwrap();
+    let mut rotated = initial.clone();
+    rotated.tokens.access_token = "rotated-private-access".into();
+    rotated.tokens.refresh_token = "rotated-private-refresh".into();
+    {
+        let store = Store::open(directory.path()).await.unwrap();
+        store.save(&rotated).await.unwrap();
+    }
+    let session_path = directory.path().join("session.json");
+    let rotated_bytes = fs::read(&session_path).unwrap();
+    exact
+        .save_bank_configuration(bank_configuration(1))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(&session_path).unwrap(), rotated_bytes);
+    let configuration_path = directory.path().join("bank-config.json");
+    let saved = fs::read(&configuration_path).unwrap();
+    for field in ["administration", "base_url", "client_id"] {
+        let mut changed = rotated.clone();
+        match field {
+            "administration" => changed.administration.as_mut().unwrap().code = 43,
+            "base_url" => changed.base_url = "https://other.example/".into(),
+            _ => changed.client_id = "other-client".into(),
+        }
+        {
+            let store = Store::open(directory.path()).await.unwrap();
+            store.save(&changed).await.unwrap();
+        }
+        assert!(exact.bank_configuration().await.is_err());
+        assert!(
+            exact
+                .save_bank_configuration(bank_configuration(2))
+                .await
+                .is_err()
+        );
+        assert!(exact.clear_bank_configuration().await.is_err());
+        assert_eq!(fs::read(&configuration_path).unwrap(), saved);
+    }
+    {
+        let store = Store::open(directory.path()).await.unwrap();
+        store.save(&rotated).await.unwrap();
+    }
+    assert_eq!(
+        exact.bank_configuration().await.unwrap(),
+        Some(bank_configuration(1))
+    );
+    assert!(exact.clear_bank_configuration().await.unwrap());
+    assert_eq!(fs::read(&session_path).unwrap(), rotated_bytes);
+    exact.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_bank_configuration_updates_preserve_other_scopes() {
+    let directory = tempdir().unwrap();
+    let first = session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+    let mut second = first.clone();
+    second.administration.as_mut().unwrap().code = 43;
+    let left_path = directory.path().to_owned();
+    let right_path = left_path.clone();
+    let left = tokio::spawn(async move {
+        let store = Store::open(&left_path).await.unwrap();
+        store
+            .save_bank_configuration(&first, bank_configuration(1))
+            .await
+            .unwrap();
+    });
+    let right = tokio::spawn(async move {
+        let store = Store::open(&right_path).await.unwrap();
+        store
+            .save_bank_configuration(&second, bank_configuration(2))
+            .await
+            .unwrap();
+    });
+    left.await.unwrap();
+    right.await.unwrap();
+    let store = Store::open(directory.path()).await.unwrap();
+    let first = session(&Url::parse("http://127.0.0.1:1").unwrap(), false);
+    let mut second = first.clone();
+    second.administration.as_mut().unwrap().code = 43;
+    assert_eq!(
+        store.bank_configuration(&first).await.unwrap(),
+        Some(bank_configuration(1))
+    );
+    assert_eq!(
+        store.bank_configuration(&second).await.unwrap(),
+        Some(bank_configuration(2))
+    );
+}

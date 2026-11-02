@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use tokio_util::task::TaskTracker;
 
 use crate::oauth;
-use crate::store::{Administration, Session, Store};
+use crate::store::{Administration, BankConfiguration, Session, Store};
 
 #[cfg(test)]
 mod tests;
@@ -81,6 +81,33 @@ impl ExactClient {
         let session = store.require_session().await?;
         self.check_scope(&session)?;
         Ok(session)
+    }
+
+    pub async fn bank_configuration(&self) -> Result<Option<BankConfiguration>> {
+        self.pinned_administration
+            .context("Pin an administration before accessing bank configuration")?;
+        let store = Store::open(&self.directory).await?;
+        let session = store.require_session().await?;
+        self.check_scope(&session)?;
+        store.bank_configuration(&session).await
+    }
+
+    pub async fn save_bank_configuration(&self, configuration: BankConfiguration) -> Result<()> {
+        self.pinned_administration
+            .context("Pin an administration before accessing bank configuration")?;
+        let store = Store::open(&self.directory).await?;
+        let session = store.require_session().await?;
+        self.check_scope(&session)?;
+        store.save_bank_configuration(&session, configuration).await
+    }
+
+    pub async fn clear_bank_configuration(&self) -> Result<bool> {
+        self.pinned_administration
+            .context("Pin an administration before accessing bank configuration")?;
+        let store = Store::open(&self.directory).await?;
+        let session = store.require_session().await?;
+        self.check_scope(&session)?;
+        store.clear_bank_configuration(&session).await
     }
 
     pub async fn administrations(&self) -> Result<Vec<Administration>> {

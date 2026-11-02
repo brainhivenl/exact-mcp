@@ -57,6 +57,11 @@ enum Command {
         #[command(subcommand)]
         command: AdministrationCommand,
     },
+    #[command(about = "Configure local bank queue accounts for the selected administration.")]
+    BankConfig {
+        #[command(subcommand)]
+        command: BankConfigCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -93,6 +98,26 @@ enum AdministrationCommand {
     },
     #[command(about = "Validate access and save the administration code for future tools.")]
     Select { code: u32 },
+}
+
+#[derive(Subcommand)]
+enum BankConfigCommand {
+    #[command(about = "Validate G/L accounts with Exact and save local bank queue configuration.")]
+    Set {
+        #[arg(long, value_name = "UUID")]
+        unassigned_gl_account_id: Vec<String>,
+    },
+    #[command(
+        about = "Show local configuration without contacting Exact or revalidating accounts."
+    )]
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
+        about = "Clear only the selected scope's local configuration without contacting Exact."
+    )]
+    Clear,
 }
 
 fn main() {
@@ -251,6 +276,90 @@ async fn run(cli: Cli) -> Result<()> {
                     AdministrationCommand::Select { code } => {
                         let selected = client.select_administration(&available, code).await?;
                         println!("Selected {} — {}", selected.code, selected.description);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            client.shutdown().await;
+            result?;
+        }
+        Command::BankConfig { command } => {
+            let mut client = exact::ExactClient::new(
+                directory,
+                oauth::http_client()?,
+                std::env::var("EXACT_CLIENT_SECRET").ok(),
+            )
+            .await?;
+            let result = async {
+                let administration = client.pin_administration()?;
+                match command {
+                    BankConfigCommand::Set {
+                        unassigned_gl_account_id,
+                    } => {
+                        let configuration = bank::validate_configuration(
+                            &client,
+                            &administration,
+                            unassigned_gl_account_id,
+                        )
+                        .await?;
+                        client
+                            .save_bank_configuration(configuration.clone())
+                            .await?;
+                        println!(
+                            "Saved local bank queue configuration for {} — {}.",
+                            administration.code, administration.description
+                        );
+                        for id in configuration.unassigned_gl_account_ids {
+                            println!("Unassigned G/L account: {id}");
+                        }
+                    }
+                    BankConfigCommand::Show { json } => {
+                        let configuration = client.bank_configuration().await?;
+                        let session = client.session().await?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "administration": administration,
+                                    "base_url": session.base_url,
+                                    "client_id": session.client_id,
+                                    "configuration": configuration,
+                                    "local_only": true,
+                                    "revalidated": false,
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "Administration: {} — {}",
+                                administration.code, administration.description
+                            );
+                            println!("Exact: {}", session.base_url);
+                            println!("Client ID: {}", session.client_id);
+                            match configuration {
+                                Some(configuration) => {
+                                    println!("Bank queue configuration: configured");
+                                    for id in configuration.unassigned_gl_account_ids {
+                                        println!("Unassigned G/L account: {id}");
+                                    }
+                                }
+                                None => println!("Bank queue configuration: not configured"),
+                            }
+                            println!("Local configuration only; not revalidated with Exact.");
+                        }
+                    }
+                    BankConfigCommand::Clear => {
+                        if client.clear_bank_configuration().await? {
+                            println!(
+                                "Cleared local bank queue configuration for {} — {}.",
+                                administration.code, administration.description
+                            );
+                        } else {
+                            println!(
+                                "No local bank queue configuration for {} — {}; nothing to clear.",
+                                administration.code, administration.description
+                            );
+                        }
                     }
                 }
                 Ok::<_, anyhow::Error>(())

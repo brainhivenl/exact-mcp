@@ -447,7 +447,13 @@ async fn invalid_inputs_fail_before_any_network() {
         );
         assert!(server.finish().await.is_empty());
     }
-    assert!(serde_json::from_value::<GetBankTransactionsToHandle>(json!({})).is_err());
+    assert!(serde_json::from_value::<GetBankTransactionsToHandle>(json!({})).is_ok());
+    assert!(
+        serde_json::from_value::<GetBankTransactionsToHandle>(
+            json!({"unassigned_gl_account_ids":null})
+        )
+        .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -466,7 +472,7 @@ async fn selected_gl_metadata_is_required_verified_and_not_own_bank_control() {
                 rows(&mut replies, 2).remove(0);
             }
             1 => rows(&mut replies, 2)[0]["Division"] = json!(43),
-            2 => selection.unassigned_gl_account_ids = vec![id(11).to_string()],
+            2 => selection.unassigned_gl_account_ids = Some(vec![id(11).to_string()]),
             3 => {
                 let copy = rows(&mut replies, 2)[0].clone();
                 rows(&mut replies, 2).push(copy);
@@ -753,5 +759,363 @@ async fn final_entry_new_counterparts_disprove_previously_unique_report_evidence
             "source became ambiguous during reconstruction; retry",
         )
         .await;
+    }
+}
+
+fn omitted_args() -> GetBankTransactionsToHandle {
+    serde_json::from_value(json!({})).unwrap()
+}
+
+fn configuration(value: u128) -> BankConfiguration {
+    BankConfiguration {
+        unassigned_gl_account_ids: vec![id(value)],
+    }
+}
+
+fn scenario_for_unassigned(value: u128) -> Vec<Reply> {
+    let mut replies = scenario();
+    rows(&mut replies, 2)[0] = gl(value, 90);
+    for index in [3, 5, 7, 8] {
+        for row in rows(&mut replies, index) {
+            if row["GLAccount"] == json!(id(10)) {
+                row["GLAccount"] = json!(id(value));
+            }
+        }
+    }
+    replies
+}
+
+fn configuration_replies() -> Vec<Reply> {
+    let mut replies: Vec<_> = scenario().into_iter().skip(1).take(2).collect();
+    rows(&mut replies, 1).truncate(1);
+    replies
+}
+
+#[tokio::test]
+async fn omitted_ids_use_saved_administration_and_match_explicit_reconstruction() {
+    let (_directory, server, client) = fixture(scenario()).await;
+    client
+        .save_bank_configuration(configuration(10))
+        .await
+        .unwrap();
+    let mut saved = serde_json::to_value(
+        get_transactions_to_handle(&client, &administration(), omitted_args())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let saved_requests = server.finish().await;
+    let (mut explicit, explicit_requests) = run(scenario(), args()).await;
+    assert_eq!(saved["configuration_source"], "saved_administration");
+    assert_eq!(explicit["configuration_source"], "arguments");
+    for result in [&mut saved, &mut explicit] {
+        result.as_object_mut().unwrap().remove("retrieved_at");
+        result
+            .as_object_mut()
+            .unwrap()
+            .remove("configuration_source");
+    }
+    assert_eq!(saved, explicit);
+    assert_eq!(saved_requests.len(), explicit_requests.len());
+    for (saved, explicit) in saved_requests.iter().zip(&explicit_requests) {
+        assert_eq!(saved.path(), explicit.path());
+        assert_eq!(saved.query(), explicit.query());
+    }
+}
+
+#[tokio::test]
+async fn missing_saved_configuration_errors_with_cli_instruction_before_network() {
+    fails(vec![], omitted_args(), "exact-mcp bank-config set").await;
+}
+
+#[tokio::test]
+async fn explicit_override_does_not_save_and_current_defaults_reload_without_restart() {
+    let mut replies = scenario();
+    replies.extend(scenario_for_unassigned(12));
+    replies.extend(scenario());
+    let (_directory, server, client) = fixture(replies).await;
+    client
+        .save_bank_configuration(configuration(12))
+        .await
+        .unwrap();
+    let explicit = serde_json::to_value(
+        get_transactions_to_handle(&client, &administration(), args())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(explicit["configuration_source"], "arguments");
+    assert_eq!(explicit["unassigned_gl_accounts"][0]["id"], json!(id(10)));
+    assert_eq!(
+        client.bank_configuration().await.unwrap(),
+        Some(configuration(12))
+    );
+    let saved = serde_json::to_value(
+        get_transactions_to_handle(&client, &administration(), omitted_args())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["configuration_source"], "saved_administration");
+    assert_eq!(saved["unassigned_gl_accounts"][0]["id"], json!(id(12)));
+    client
+        .save_bank_configuration(configuration(10))
+        .await
+        .unwrap();
+    let changed = serde_json::to_value(
+        get_transactions_to_handle(&client, &administration(), omitted_args())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(changed["unassigned_gl_accounts"][0]["id"], json!(id(10)));
+    assert_eq!(server.finish().await.len(), 27);
+}
+
+#[tokio::test]
+async fn invalid_explicit_ids_and_non_id_arguments_never_fall_back_or_read_api() {
+    for input in [
+        json!({"unassigned_gl_account_ids":[]}),
+        json!({"unassigned_gl_account_ids":["bad"]}),
+        json!({"unassigned_gl_account_ids":[id(0)]}),
+        json!({"unassigned_gl_account_ids":[id(10),id(10)]}),
+        json!({"unassigned_gl_account_ids":(1..=11).map(id).collect::<Vec<_>>()}),
+        json!({"limit":0}),
+        json!({"limit":101}),
+        json!({"offset":u32::MAX}),
+        json!({"journal_code":" "}),
+        json!({"transaction_date_from":"2025-02-01","transaction_date_to":"2025-01-01"}),
+    ] {
+        let (_directory, server, client) = fixture(vec![]).await;
+        client
+            .save_bank_configuration(configuration(10))
+            .await
+            .unwrap();
+        assert!(
+            get_transactions_to_handle(
+                &client,
+                &administration(),
+                serde_json::from_value(input).unwrap(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            client.bank_configuration().await.unwrap(),
+            Some(configuration(10))
+        );
+        assert!(server.finish().await.is_empty());
+    }
+    for input in [
+        json!({"limit":0}),
+        json!({"offset":u32::MAX}),
+        json!({"journal_code":" "}),
+        json!({"transaction_date_from":"2025-02-01","transaction_date_to":"2025-01-01"}),
+    ] {
+        let (_directory, server, client) = fixture(vec![]).await;
+        let error = get_transactions_to_handle(
+            &client,
+            &administration(),
+            serde_json::from_value(input).unwrap(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(!format!("{error:#}").contains("No unassigned bank G/L settings"));
+        assert!(server.finish().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn saved_configuration_cannot_cross_administration_origin_or_client_id() {
+    for case in 0..3 {
+        let (directory, server, client) = fixture(vec![]).await;
+        client
+            .save_bank_configuration(configuration(10))
+            .await
+            .unwrap();
+        {
+            let store = Store::open(directory.path()).await.unwrap();
+            let mut session = store.require_session().await.unwrap();
+            match case {
+                0 => session.administration.as_mut().unwrap().code = 43,
+                1 => session.base_url = session.base_url.replace("127.0.0.1", "localhost"),
+                2 => session.client_id = "another-invented-client".into(),
+                _ => unreachable!(),
+            }
+            store.save(&session).await.unwrap();
+        }
+        let error = get_transactions_to_handle(&client, &administration(), omitted_args())
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("Account or administration changed"));
+        let mut fresh = ExactClient::new(
+            directory.path().into(),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let selected = fresh.pin_administration().unwrap();
+        let error = get_transactions_to_handle(&fresh, &selected, omitted_args())
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("No unassigned bank G/L settings"));
+        assert!(server.finish().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn saved_ids_are_revalidated_against_fresh_masterdata_on_every_call() {
+    for (case, message, end) in [
+        (0, "metadata is missing", 3),
+        (1, "wrong-scope G/L", 3),
+        (2, "own-bank control", 2),
+        (3, "Duplicate G/L", 3),
+        (4, "wrong-scope bank journal", 2),
+    ] {
+        let mut replies = scenario();
+        match case {
+            0 => {
+                rows(&mut replies, 2).remove(0);
+            }
+            1 => rows(&mut replies, 2)[0]["Division"] = json!(43),
+            2 => rows(&mut replies, 1)[0]["GLAccount"] = json!(id(10)),
+            3 => {
+                let copy = rows(&mut replies, 2)[0].clone();
+                rows(&mut replies, 2).push(copy);
+            }
+            4 => rows(&mut replies, 1)[0]["Division"] = json!(43),
+            _ => unreachable!(),
+        }
+        replies.truncate(end);
+        let (_directory, server, client) = fixture(replies).await;
+        client
+            .save_bank_configuration(configuration(10))
+            .await
+            .unwrap();
+        let error = get_transactions_to_handle(&client, &administration(), omitted_args())
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+        assert_eq!(
+            client.bank_configuration().await.unwrap(),
+            Some(configuration(10))
+        );
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn configuration_validation_only_reads_general_ledger_masterdata_and_never_saves() {
+    let (_directory, server, client) = fixture(configuration_replies()).await;
+    let validated = validate_configuration(&client, &administration(), vec![id(10).to_string()])
+        .await
+        .unwrap();
+    assert_eq!(validated, configuration(10));
+    assert_eq!(client.bank_configuration().await.unwrap(), None);
+    let requests = server.finish().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].path().ends_with("financial/Journals"));
+    assert!(requests[1].path().ends_with("financial/GLAccounts"));
+    let filter = requests[1]
+        .query_pairs()
+        .find(|(key, _)| key == "$filter")
+        .unwrap()
+        .1;
+    assert_eq!(filter, format!("(ID eq guid'{}')", id(10)));
+}
+
+#[tokio::test]
+async fn configuration_validation_rejects_invalid_ids_before_network_without_saving() {
+    for ids in [
+        vec![],
+        vec!["bad".into()],
+        vec![id(0).to_string()],
+        vec![id(10).to_string(), id(10).to_string()],
+        (1..=11).map(|value| id(value).to_string()).collect(),
+    ] {
+        let (_directory, server, client) = fixture(vec![]).await;
+        client
+            .save_bank_configuration(configuration(12))
+            .await
+            .unwrap();
+        assert!(
+            validate_configuration(&client, &administration(), ids)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client.bank_configuration().await.unwrap(),
+            Some(configuration(12))
+        );
+        assert!(server.finish().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn configuration_validation_rejects_bad_metadata_without_overwriting_saved_defaults() {
+    for (case, message, end) in [
+        (0, "metadata is missing", 2),
+        (1, "wrong-scope G/L", 2),
+        (2, "own-bank control", 1),
+        (3, "Duplicate G/L", 2),
+        (4, "wrong-scope bank journal", 1),
+        (5, "wrong-scope G/L", 2),
+    ] {
+        let mut replies = configuration_replies();
+        match case {
+            0 => rows(&mut replies, 1).clear(),
+            1 => rows(&mut replies, 1)[0]["Division"] = json!(43),
+            2 => rows(&mut replies, 0)[0]["GLAccount"] = json!(id(10)),
+            3 => {
+                let copy = rows(&mut replies, 1)[0].clone();
+                rows(&mut replies, 1).push(copy);
+            }
+            4 => rows(&mut replies, 0)[0]["Division"] = json!(43),
+            5 => rows(&mut replies, 1).push(gl(20, 22)),
+            _ => unreachable!(),
+        }
+        replies.truncate(end);
+        let (_directory, server, client) = fixture(replies).await;
+        client
+            .save_bank_configuration(configuration(12))
+            .await
+            .unwrap();
+        let error = validate_configuration(&client, &administration(), vec![id(10).to_string()])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+        assert_eq!(
+            client.bank_configuration().await.unwrap(),
+            Some(configuration(12))
+        );
+        server.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn configuration_validation_checks_selected_scope_before_and_after_metadata() {
+    let (_directory, server, client) = fixture(vec![]).await;
+    let mut wrong = administration();
+    wrong.code = 43;
+    let error = validate_configuration(&client, &wrong, vec![id(10).to_string()])
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("differs from the selected session"));
+    assert!(server.finish().await.is_empty());
+    for index in 0..2 {
+        let mut replies = configuration_replies();
+        replies[index].change_administration = true;
+        replies.truncate(index + 1);
+        let (_directory, server, client) = fixture(replies).await;
+        let error = validate_configuration(&client, &administration(), vec![id(10).to_string()])
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Account or administration changed"));
+        assert_eq!(server.finish().await.len(), index + 1);
     }
 }
