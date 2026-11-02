@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -222,6 +222,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                     | "get_invoice_details"
                     | "get_invoice_matches"
                     | "get_payment_details"
+                    | "get_bank_transactions_to_handle"
                     | "search_gl_accounts"
                     | "get_ledger_report"
                     | "list_invoice_documents"
@@ -229,6 +230,17 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             )
         ));
     }
+    let bank_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "get_bank_transactions_to_handle")
+        .unwrap()["inputSchema"];
+    assert!(bank_schema["properties"]["unassigned_gl_account_ids"].is_object());
+    assert!(
+        bank_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unassigned_gl_account_ids"))
+    );
     let search_schema = &tools
         .iter()
         .find(|tool| tool["name"] == "search_accounts")
@@ -1162,6 +1174,170 @@ fn stdio_drafts_are_commercial_read_only_and_distinct_from_posted_invoices() {
     let text = details["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     assert!(!details.to_string().contains("fixture-access-token"));
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_bank_queue_uses_configured_postings_and_open_items_not_open_status() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let unassigned = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let bank = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let payable = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    let control = "22222222-2222-2222-2222-222222222222";
+    let ap_control = "33333333-3333-3333-3333-333333333333";
+    let api = thread::spawn(move || {
+        let entry = "77777777-7777-7777-7777-777777777777";
+        let unassigned_posting = "44444444-4444-4444-4444-444444444444";
+        let ap_posting = "55555555-5555-5555-5555-555555555555";
+        let handled_control = "66666666-6666-6666-6666-666666666666";
+        let line = |id: &str,
+                    gl: &str,
+                    offset: Option<&str>,
+                    account: Option<&str>,
+                    date: &str,
+                    amount: Value| {
+            json!({"ID":id,"EntryID":entry,"Division":42,"EntryNumber":123,"FinancialYear":2025,"FinancialPeriod":1,"LineNumber":1,"LineType":0,"JournalCode":"21","GLAccount":gl,"Account":account,"OffsetID":offset,"Type":40,"Status":20,"Date":date,"AmountDC":amount,"AmountFC":amount,"Currency":"EUR","Description":"Invented bank posting"})
+        };
+        let first = line(control, bank, None, None, "2025-01-02", json!(-4.25));
+        let mut second = line(
+            ap_control,
+            bank,
+            None,
+            Some(ACCOUNT_ID),
+            "2025-01-03",
+            json!(-7.5),
+        );
+        second["Currency"] = json!("USD");
+        second["AmountFC"] = json!(-10);
+        let unallocated = line(
+            unassigned_posting,
+            unassigned,
+            Some(control),
+            None,
+            "2025-01-02",
+            json!(4.25),
+        );
+        let ap = line(
+            ap_posting,
+            payable,
+            Some(ap_control),
+            Some(ACCOUNT_ID),
+            "2025-01-03",
+            json!(7.5),
+        );
+        let handled = line(handled_control, bank, None, None, "2025-01-04", json!(1));
+        let handled_booking = line(
+            "88888888-8888-8888-8888-888888888888",
+            "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            Some(handled_control),
+            None,
+            "2025-01-04",
+            json!(-1),
+        );
+        let responses = [
+            (
+                "/system/Divisions?",
+                json!({"d":[{"Code":42,"Currency":"EUR"}]}),
+            ),
+            (
+                "/financial/Journals?",
+                json!({"d":[{"ID":"99999999-9999-9999-9999-999999999999","Division":42,"Code":"21","Type":12,"GLAccount":bank,"Description":"Fixture bank"}]}),
+            ),
+            (
+                "/financial/GLAccounts?",
+                json!({"d":[{"ID":unassigned,"Division":42,"Code":"1999","Description":"Confirmed unallocated bank","Type":90},{"ID":payable,"Division":42,"Code":"2000","Description":"Payables","Type":22}]}),
+            ),
+            (
+                "/financialtransaction/TransactionLines?",
+                json!({"d":[unallocated.clone()]}),
+            ),
+            (
+                "/read/financial/PayablesList?",
+                json!({"d":[{"HID":1,"AccountId":ACCOUNT_ID,"EntryNumber":123,"JournalCode":"21","Amount":-2.5,"CurrencyCode":"EUR"}]}),
+            ),
+            (
+                "/financialtransaction/TransactionLines?",
+                json!({"d":[ap.clone(),second.clone()]}),
+            ),
+            ("/read/financial/ReceivablesList?", json!({"d":[]})),
+            (
+                "/financialtransaction/TransactionLines?",
+                json!({"d":[first.clone(),second.clone()]}),
+            ),
+            (
+                "/financialtransaction/TransactionLines?",
+                json!({"d":{"results":[first,unallocated,second],"__next":"?page=2"}}),
+            ),
+            (
+                "/financialtransaction/TransactionLines?page=2",
+                json!({"d":[ap,handled,handled_booking]}),
+            ),
+        ];
+        for (index, (path, body)) in responses.into_iter().enumerate() {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"), "{target}");
+            assert!(target.contains(path), "{target}");
+            let url = reqwest::Url::parse(&format!(
+                "http://localhost{}",
+                target.split_whitespace().nth(1).unwrap()
+            ))
+            .unwrap();
+            let parameters: std::collections::HashMap<_, _> =
+                url.query_pairs().into_owned().collect();
+            if let Some(filter) = parameters.get("$filter") {
+                assert!(
+                    !filter.contains("Status"),
+                    "Queue must not use accounting status: {filter}"
+                );
+                if index == 3 {
+                    assert!(filter.contains(unassigned));
+                    assert!(!filter.contains("OffsetID ne null"));
+                }
+                if index == 5 {
+                    assert!(filter.contains(ACCOUNT_ID));
+                    assert!(filter.contains("EntryNumber eq 123"));
+                    assert!(!filter.contains("OffsetID ne null"));
+                }
+            }
+            if let Some(fields) = parameters.get("$select") {
+                assert!(!fields.contains("BankAccountNumber"));
+            }
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response = process.request(2, "tools/call", json!({"name":"get_bank_transactions_to_handle","arguments":{"unassigned_gl_account_ids":[unassigned],"limit":1}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["reconstructed_transaction_count"], 2);
+    assert_eq!(result["matched_transaction_count"], 2);
+    assert_eq!(result["source_bank_outstanding_item_count"], 1);
+    assert_eq!(result["coverage_complete"], true);
+    assert_eq!(result["unresolved_items"], json!([]));
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["transactions"].as_array().unwrap().len(), 1);
+    let transaction = &result["transactions"][0];
+    assert_eq!(transaction["id"], ap_control);
+    assert_eq!(
+        transaction["reasons"],
+        json!(["outstanding_payable_posting"])
+    );
+    assert_eq!(transaction["amount_default_currency"], "-7.5");
+    assert_eq!(transaction["amount_transaction_currency"], "-10");
+    assert_eq!(transaction["currency"], "USD");
+    assert_eq!(
+        transaction["evidence"][0]["outstanding_item"]["amount"],
+        "-2.5"
+    );
+    assert_eq!(transaction["booking_lines"].as_array().unwrap().len(), 1);
+    assert_eq!(result["has_more"], true);
+    assert_eq!(result["next_offset"], 1);
+    assert!(!response.to_string().contains("fixture-access-token"));
     api.join().unwrap();
     process.shutdown();
 }

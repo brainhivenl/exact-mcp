@@ -415,6 +415,13 @@ impl Backend {
         crate::ledger::get_report(&self.client, &self.administration, args).await
     }
 
+    pub async fn get_bank_transactions_to_handle(
+        &self,
+        args: crate::bank::GetBankTransactionsToHandle,
+    ) -> Result<crate::bank::BankTransactionsToHandle> {
+        crate::bank::get_transactions_to_handle(&self.client, &self.administration, args).await
+    }
+
     pub async fn get_payment_details(
         &self,
         args: crate::payment::GetPaymentDetails,
@@ -831,7 +838,7 @@ fn parse_date(value: &str) -> Option<NaiveDate> {
         .or_else(|| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
 }
 
-fn deserialize_report_id<'de, D: Deserializer<'de>>(
+pub(crate) fn deserialize_report_id<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
