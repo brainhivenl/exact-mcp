@@ -5071,3 +5071,6 @@ async fn concurrent_bank_configuration_updates_preserve_other_scopes() {
         Some(bank_configuration(2))
     );
 }
+
+#[path = "master_data/tests.rs"]
+mod master_data_tests;

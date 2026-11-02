@@ -482,7 +482,7 @@ pub(crate) async fn get_details(
     })
 }
 
-fn number_string<S: Serializer>(
+pub(crate) fn number_string<S: Serializer>(
     value: &Option<serde_json::Number>,
     serializer: S,
 ) -> std::result::Result<S::Ok, S::Error> {

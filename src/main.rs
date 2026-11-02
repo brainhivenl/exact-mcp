@@ -4,6 +4,7 @@ mod exact;
 mod financial;
 mod invoice;
 mod ledger;
+mod master_data;
 mod matching;
 mod mcp;
 mod oauth;

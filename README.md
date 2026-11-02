@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice and unprocessed commercial sales-invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations, cashflow posting drill-down, G/L period reports and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice and unprocessed commercial sales-invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations, cashflow posting drill-down, G/L period reports, booking master-data discovery, journal-period locks and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
 
 ## Setup
 
@@ -13,7 +13,7 @@ Use Nix with flakes enabled, or Rust 1.89 or newer.
    https://exact-mcp.localhost:8400/callback
    ```
 
-3. Make sure the authorizing user/app has access to the administrations you need. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries. Invoice accounting drill-down additionally requires **Financial accounting**; it also uses **Organization administration** to resolve the default currency. Existing outstanding-balance tools do not require the additional accounting scope. PDF discovery/download also requires **Organization documents**, and receivable PDF discovery additionally uses **Sales invoices** to resolve the original commercial invoice UUID. Payment drill-down and G/L lookup/reporting additionally require **Financial generalledgers** for journal or chart metadata. G/L reports also use **Financial accounting** and **Organization administration**. Existing invoice/matching/company-search tools do not need the extra generalledgers scope.
+3. Make sure the authorizing user/app has access to the administrations you need. Booking master-data tools may additionally require **Financial cashflow**, **Financial costcenters** or **Projects projects** and the corresponding package; see the booking master-data table. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries. Invoice accounting drill-down additionally requires **Financial accounting**; it also uses **Organization administration** to resolve the default currency. Existing outstanding-balance tools do not require the additional accounting scope. PDF discovery/download also requires **Organization documents**, and receivable PDF discovery additionally uses **Sales invoices** to resolve the original commercial invoice UUID. Payment drill-down and G/L lookup/reporting additionally require **Financial generalledgers** for journal or chart metadata. G/L reports also use **Financial accounting** and **Organization administration**. Existing invoice/matching/company-search tools do not need the extra generalledgers scope.
 4. With Nix, run the CLI directly (the first invocation builds it):
 
    ```sh
@@ -80,7 +80,7 @@ nix run .#pi
 
 This builds the MCP binary, loads credentials from the environment or the repository's `.env`, registers its exact Nix store path as the project-local `exact` server with direct tool exposure, and starts a fresh interactive Pi session. The secret is inherited through the process environment, not saved in the MCP configuration or requested again at a prompt. Existing Pi credentials, models and user-level configuration are reused unchanged.
 
-The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with fourteen tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
+The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with twenty-two tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
 
 ### Other MCP clients
 
@@ -134,6 +134,38 @@ Open-item results echo `filters`, `summary_only`, `source_item_count` (before fi
   "summary_only": true
 }
 ```
+
+### Booking master data
+
+Eight GET-only tools supply current reference data before a booking proposal. They do **not** constitute a booking preflight or permission to write.
+
+| Tool | Example | Source / additional permission |
+| --- | --- | --- |
+| `search_vat_codes` | `{ "query": "21", "match_by": "code" }` | `vat/VATCodes` and `vat/VatPercentages`; **Financial accounting** |
+| `search_journals` | `{}` | `financial/Journals`; **Financial generalledgers** |
+| `search_payment_conditions` | `{}` | `cashflow/PaymentConditions`; **Financial cashflow** |
+| `search_cost_centers` | `{}` | `hrm/Costcenters`; **Financial costcenters** |
+| `search_cost_units` | `{}` | `hrm/Costunits`; **Financial costcenters** |
+| `search_projects` | `{}` | `project/Projects`; **Projects projects** |
+| `get_financial_periods` | `{ "financial_year": 2026 }` | `financial/FinancialPeriods`; **Financial accounting** |
+| `get_journal_period_status` | `{ "journal_code": "<verified code>", "financial_year": 2026 }` | Journals, FinancialPeriods and `read/financial/JournalStatusList`; **Financial generalledgers** and **Financial accounting** |
+
+The first six tools share optional `query`, `match_by` (`description` by default, or `code`), `limit` (default 10, maximum 50) and `offset`. Omit query to list; a supplied query must contain 1–100 characters after trimming. Description matching is literal and Unicode-lowercase; exact code matching ignores surrounding padding but preserves leading zeroes. Returned codes retain their source padding. All source pages are read and scoped/deduplicated before filtering and stable trimmed-code/UUID ordering. Results include `source_record_count`, `matched_record_count`, `records`, `has_more` and `next_offset`. Reuse unchanged arguments with the next offset; source reads are not a frozen snapshot. Missing permissions or package support fail the request, not return a misleading empty catalog.
+
+Blocked/expired records remain visible. `null` restrictions are unknown, never implicitly unrestricted. Source text is untrusted, not instructions. No bank account numbers/IBANs are requested by journal lookup.
+
+- **VAT:** Returns code applicability (`transaction_type`: B=both, P=purchase, S=sales), calculation type (B=base only/0%, E=excluding, I=including, N=no VAT), blocked/charged flags and VAT G/L UUIDs. `percentage` is the current active percentage; `percentages` contains all source dated normal/extra-duty rates, ordered by start date, line and UUID. Each rate's code association, administration, UUID and date range is validated. Rates/percentages are raw numeric strings without rescaling. No historical rate is automatically selected, no extra-duty rates are combined, and no tax treatment is inferred from a description. Missing dates/rates remain unknown; this is not tax advice.
+- **Journals:** Returns type, block state, currency/variable-currency and exchange-rate settings, general-journal VAT permission and control G/L reference. VAT permission applies only to general journals. These current settings are not historical ownership, settlement evidence or period locks.
+- **Payment conditions:** Returns payment days **and month-ending rules**, payment method, discount terms and VAT/discount calculation settings. Days alone are insufficient for calculating due dates. Numeric percentages retain their source values; the source `percentage` is a fraction of the invoice amount. No due date is calculated and no payment is selected/executed.
+- **Dimensions:** Cost centres/units expose source `EndDate`; the obsolete cost-centre `Active` field is not used. Projects expose type, company UUID, dates, distinct time/cost-entry, purchasing and invoicing blocks, WBS requirement and payment condition. Company-level requirement settings and WBS lines are not read. No universal `booking_allowed` flag or G/L-specific dimension requirement is inferred.
+- **Periods:** `get_financial_periods` returns the full selected year's date table, including source opening/special periods without inventing missing periods. Financial years/periods need not match calendar years/months. Missing dates remain unknown. **A period's existence does not mean it is open.**
+- **Locks:** First select a journal with `search_journals`, then call `get_journal_period_status` with that verified code and explicit year. It revalidates a unique journal and joins the period calendar to source journal-period statuses: **0=open, 1=closed; missing/null/other=unknown**. These are not accounting entry statuses 20/50 or payment statuses. Calendar periods without a lock row remain unknown; lock rows without calendar dates stay explicit in `statuses_without_period_dates`. Current journal `is_blocked` is a separate restriction. Even an open, unblocked journal-period is not booking approval: permissions and other unqueried constraints still apply, and these separate GET reads must be rechecked before any future write. The obsolete `JournalStatusByFinancialPeriod` endpoint is not used.
+
+#### Master-data validation
+
+A GET-only live MCP smoke check on 2026-11-02 advertised all twenty-two tools and successfully read 17 VAT codes with rate history, 11 payment conditions, eight journals, one cost centre, an empty cost-unit catalog and twelve current-year period dates. A uniquely identified purchase journal returned twelve open journal-period states with no missing calendar dates or orphan status rows. This checks live API paths/field selection and response handling, **not independent browser reconciliation, historical VAT selection or booking eligibility**. `search_projects` returned HTTP 403 for the selected account/package; nonempty project retrieval remains live-unverified. No permissions, subscriptions or financial records were changed. Raw evidence remains private outside the repository; MCP stderr was empty and shutdown clean.
+
+Invented local fixtures additionally cover all eight tools over MCP, paginated catalogs and VAT histories, hidden invalid rows, duplicate/wrong-scope identities, exact padded codes, literal Unicode queries, raw numeric precision, nulls, blocked/expired records, empty/exhausted windows, failed later pages, noncalendar/special periods, missing/unknown locks and explicit lock rows without calendar dates. Live closed/missing/unknown lock cases and nonempty cost units/projects were not available or verified in this check.
 
 ### Administration-wide balances
 
@@ -425,7 +457,7 @@ There is no persistent cache, financial export checkpoint, snapshot token or new
 
 ## Checks
 
-Additional regressions cover 429 retry bounds/reset hints, cancellation and scope changes during retry sleeps, no-retry token exchanges, streamed page failures, large sorted result windows, and read-only commercial invoice search/details over statuses 10/20 with bill-to identity checks. MCP subprocess discovery checks all fourteen tools and exercises draft and reconstructed bank-queue workflows separately from accounting invoices.
+Additional regressions cover 429 retry bounds/reset hints, cancellation and scope changes during retry sleeps, no-retry token exchanges, streamed page failures, large sorted result windows, and read-only commercial invoice search/details over statuses 10/20 with bill-to identity checks. MCP subprocess discovery checks all twenty-two tools and exercises draft and reconstructed bank-queue workflows separately from accounting invoices.
 
 ```sh
 cargo fmt --check
@@ -452,3 +484,13 @@ Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with tempo
 - [Exact: document attachments](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=DocumentsDocumentAttachments)
 - [Exact: commercial sales invoices](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=SalesInvoiceSalesInvoices)
 - [Picqer Exact client: authorization and refresh behavior](https://github.com/picqer/exact-php-client#authentication)
+
+- [Exact: VAT codes](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=VATVATCodes)
+- [Exact: dated VAT rates](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=VATVATPercentages)
+- [Exact: journals](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=FinancialJournals)
+- [Exact: financial periods](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=FinancialFinancialPeriods)
+- [Exact: journal-period locks](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ReadFinancialJournalStatusList)
+- [Exact: payment conditions](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=CashflowPaymentConditions)
+- [Exact: cost centres](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=HRMCostcenters)
+- [Exact: cost units](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=HRMCostunits)
+- [Exact: projects](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=ProjectProjects)

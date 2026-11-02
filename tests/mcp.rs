@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 22);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -214,6 +214,14 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "search_vat_codes"
+                    | "search_journals"
+                    | "search_payment_conditions"
+                    | "search_cost_centers"
+                    | "search_cost_units"
+                    | "search_projects"
+                    | "get_financial_periods"
+                    | "get_journal_period_status"
                     | "search_draft_invoices"
                     | "get_draft_invoice_details"
                     | "search_invoices"
@@ -230,6 +238,41 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             )
         ));
     }
+    for name in [
+        "search_vat_codes",
+        "search_journals",
+        "search_payment_conditions",
+        "search_cost_centers",
+        "search_cost_units",
+        "search_projects",
+    ] {
+        let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["query"].is_object());
+        assert!(schema["properties"]["match_by"].is_object());
+        assert!(schema["properties"]["offset"].is_object());
+        assert!(
+            !schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("query")))
+        );
+    }
+    let lock_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "get_journal_period_status")
+        .unwrap()["inputSchema"];
+    assert!(
+        lock_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("journal_code"))
+    );
+    assert!(
+        lock_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("financial_year"))
+    );
     let bank_schema = &tools
         .iter()
         .find(|tool| tool["name"] == "get_bank_transactions_to_handle")
@@ -1390,4 +1433,105 @@ fn stdio_bank_queue_uses_configured_postings_and_open_items_not_open_status() {
         }
         process.shutdown();
     }
+}
+
+#[test]
+fn stdio_booking_master_data_and_journal_locks_are_read_only() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let api = thread::spawn(move || {
+        let record = json!({"ID":ACCOUNT_ID,"Division":42,"Code":" 001 ","Description":"Invented master data"});
+        let journal = json!({"ID":ACCOUNT_ID,"Division":42,"Code":" P1 ","Description":"Invented purchase journal","Type":22,"IsBlocked":true});
+        let period = json!({"ID":ACCOUNT_ID,"Division":42,"FinYear":2025,"FinPeriod":13,"StartDate":"2025-12-31","EndDate":"2025-12-31"});
+        let replies = [
+            ("/vat/VATCodes?", json!({"d":[record.clone()]})),
+            (
+                "/vat/VatPercentages?",
+                json!({"d":[{"ID":"22222222-2222-2222-2222-222222222222","Division":42,"VATCodeID":ACCOUNT_ID,"Percentage":0.21,"Type":0}]}),
+            ),
+            ("/financial/Journals?", json!({"d":[journal.clone()]})),
+            (
+                "/cashflow/PaymentConditions?",
+                json!({"d":[record.clone()]}),
+            ),
+            ("/hrm/Costcenters?", json!({"d":[record.clone()]})),
+            ("/hrm/Costunits?", json!({"d":[record.clone()]})),
+            ("/project/Projects?", json!({"d":[record]})),
+            (
+                "/financial/FinancialPeriods?",
+                json!({"d":[period.clone()]}),
+            ),
+            ("/financial/Journals?", json!({"d":[journal]})),
+            ("/financial/FinancialPeriods?", json!({"d":[period]})),
+            (
+                "/read/financial/JournalStatusList?",
+                json!({"d":[{"Journal":"P1","Year":2025,"Period":13,"Status":0}]}),
+            ),
+        ];
+        for (path, body) in replies {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"), "{target}");
+            assert!(target.contains(path), "{target}");
+            assert!(!target.contains("IBAN") && !target.contains("BankAccount"));
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    for (index, name) in [
+        "search_vat_codes",
+        "search_journals",
+        "search_payment_conditions",
+        "search_cost_centers",
+        "search_cost_units",
+        "search_projects",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = process.request(
+            2 + index as u32,
+            "tools/call",
+            json!({"name":name,"arguments":{"limit":1}}),
+        );
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let result = &response["result"]["structuredContent"];
+        assert_eq!(result["administration"]["Code"], 42);
+        assert_eq!(result["matched_record_count"], 1);
+        assert_eq!(result["records"].as_array().unwrap().len(), 1);
+        if name == "search_vat_codes" {
+            assert_eq!(result["records"][0]["percentages"][0]["percentage"], "0.21");
+        }
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+        assert!(!response.to_string().contains("fixture-access-token"));
+    }
+    let response = process.request(
+        8,
+        "tools/call",
+        json!({"name":"get_financial_periods","arguments":{"financial_year":2025}}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["periods"][0]["financial_period"],
+        13
+    );
+    let response=process.request(9,"tools/call",json!({"name":"get_journal_period_status","arguments":{"journal_code":"P1","financial_year":2025}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["journal"]["is_blocked"], true);
+    assert_eq!(result["periods"][0]["journal_period_state"], "open");
+    assert_eq!(result["periods"][0]["status_code"], 0);
+    assert!(result.get("booking_allowed").is_none());
+    let response = process.request(
+        10,
+        "tools/call",
+        json!({"name":"search_vat_codes","arguments":{"limit":0}}),
+    );
+    assert_eq!(response["result"]["isError"], true);
+    api.join().unwrap();
+    process.shutdown();
+    assert!(!directory.join("downloads").exists());
 }

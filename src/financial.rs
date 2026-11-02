@@ -401,6 +401,64 @@ impl Backend {
         crate::draft::get_details(&self.client, &self.administration, args).await
     }
 
+    pub async fn search_vat_codes(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::VatCode>> {
+        crate::master_data::search_vat_codes(&self.client, &self.administration, args).await
+    }
+
+    pub async fn search_journals(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::Journal>> {
+        crate::master_data::search_journals(&self.client, &self.administration, args).await
+    }
+
+    pub async fn search_payment_conditions(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::PaymentCondition>> {
+        crate::master_data::search_payment_conditions(&self.client, &self.administration, args)
+            .await
+    }
+
+    pub async fn search_cost_centers(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::CostDimension>> {
+        crate::master_data::search_cost_centers(&self.client, &self.administration, args).await
+    }
+
+    pub async fn search_cost_units(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::CostDimension>> {
+        crate::master_data::search_cost_units(&self.client, &self.administration, args).await
+    }
+
+    pub async fn search_projects(
+        &self,
+        args: crate::master_data::SearchMasterData,
+    ) -> Result<crate::master_data::SearchResult<crate::master_data::Project>> {
+        crate::master_data::search_projects(&self.client, &self.administration, args).await
+    }
+
+    pub async fn get_financial_periods(
+        &self,
+        args: crate::master_data::GetFinancialPeriods,
+    ) -> Result<crate::master_data::FinancialPeriodsResult> {
+        crate::master_data::get_financial_periods(&self.client, &self.administration, args).await
+    }
+
+    pub async fn get_journal_period_status(
+        &self,
+        args: crate::master_data::GetJournalPeriodStatus,
+    ) -> Result<crate::master_data::JournalPeriodStatusResult> {
+        crate::master_data::get_journal_period_status(&self.client, &self.administration, args)
+            .await
+    }
+
     pub async fn search_gl_accounts(
         &self,
         args: crate::ledger::SearchGlAccounts,
