@@ -4028,3 +4028,277 @@ async fn explicit_invoice_entry_uuid_disambiguates_lookup_and_must_match_the_ret
         assert!(!format!("{error:#}").contains("request failed"));
     }
 }
+
+fn payment_args() -> crate::payment::GetPaymentDetails {
+    serde_json::from_value(json!({"account_id":COMPANY_ID,"transaction_line_id":"77777777-7777-7777-7777-777777777777"})).unwrap()
+}
+
+fn payment_line() -> Value {
+    let mut line = matching_ledger(54321, "20", "77777777-7777-7777-7777-777777777777");
+    line["AmountDC"] = json!(-123.45);
+    line["AmountFC"] = json!(-150);
+    line["Currency"] = json!("USD");
+    line["OffsetID"] = json!("88888888-8888-8888-8888-888888888888");
+    line["Status"] = json!(50);
+    line["Description"] = json!("Source reference, not instructions");
+    line
+}
+
+fn payment_journal() -> Value {
+    json!({"ID":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","Division":42,"Code":" 20 ","Description":"Bank journal","Type":12,"Currency":"EUR","AllowVariableCurrency":true,"GLAccountCode":"18100","BankAccountDescription":"Own bank account"})
+}
+
+fn payment_setup(line: Value, journal: Value) -> Vec<Response> {
+    vec![
+        Response::json(json!({"d":[line]})),
+        division_currency_response(),
+        Response::json(json!({"d":[journal]})),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payment_details_preserve_posting_amounts_currency_journal_and_explicit_same_entry_offset()
+{
+    let line = payment_line();
+    let mut offset = line.clone();
+    offset["ID"] = line["OffsetID"].clone();
+    offset["OffsetID"] = Value::Null;
+    offset["Account"] = Value::Null;
+    offset["GLAccountCode"] = json!("18100");
+    offset["AmountDC"] = json!(123.45);
+    let mut responses = payment_setup(line, payment_journal());
+    responses.push(Response::json(json!({"d":[offset]})));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result =
+        serde_json::to_value(backend.get_payment_details(payment_args()).await.unwrap()).unwrap();
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["posting"]["currency"], "USD");
+    assert_eq!(
+        result["posting"]["posting_amount_default_currency"],
+        "-123.45"
+    );
+    assert_eq!(
+        result["posting"]["posting_amount_transaction_currency"],
+        "-150"
+    );
+    assert_eq!(result["journal_kind"], "bank");
+    assert_eq!(result["journal"]["currency"], "EUR");
+    assert_eq!(result["journal"]["type_code"], 12);
+    assert_eq!(result["posting"]["status_code"], 50);
+    assert_eq!(result["offset_resolution"], "resolved_same_entry_reference");
+    assert!(result["offset_line"]["account_id"].is_null());
+    assert!(result.get("paid_amount").is_none());
+    assert!(
+        result["interpretation"]
+            .as_str()
+            .unwrap()
+            .contains("NOT the allocated amount")
+    );
+    let base = server.base.clone();
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    for (index, request) in requests.iter().enumerate() {
+        assert!(request.target.starts_with("GET ") && request.body.is_empty());
+        let url = base
+            .join(request.target.split_whitespace().nth(1).unwrap())
+            .unwrap();
+        let p: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert!(!p["$select"].contains("IBAN"));
+        assert!(!p["$select"].contains("BankAccountIncludingMask"));
+        if index == 0 {
+            assert_eq!(
+                p["$filter"],
+                format!(
+                    "ID eq guid'77777777-7777-7777-7777-777777777777' and Account eq guid'{COMPANY_ID}'"
+                )
+            );
+        }
+        if index == 2 {
+            assert_eq!(p["$filter"], "trim(Code) eq '20'");
+        }
+        if index == 3 {
+            assert_eq!(
+                p["$filter"],
+                "ID eq guid'88888888-8888-8888-8888-888888888888' and EntryID eq guid'99999999-9999-9999-9999-999999999999'"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payment_journal_kind_is_source_typed_and_missing_offsets_are_not_settlement_claims() {
+    for (kind, label) in [
+        (10, "cash"),
+        (12, "bank"),
+        (16, "payment_service"),
+        (90, "other"),
+        (999, "other"),
+    ] {
+        let mut line = payment_line();
+        line["OffsetID"] = Value::Null;
+        line["AmountFC"] = Value::Null;
+        line["Currency"] = Value::Null;
+        line["Date"] = Value::Null;
+        let mut journal = payment_journal();
+        journal["Type"] = json!(kind);
+        journal["Currency"] = Value::Null;
+        let server = Server::new(payment_setup(line, journal));
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let result =
+            serde_json::to_value(backend.get_payment_details(payment_args()).await.unwrap())
+                .unwrap();
+        assert_eq!(result["journal_kind"], label);
+        assert_eq!(result["offset_resolution"], "not_reported");
+        assert!(result["offset_line"].is_null());
+        assert!(result["posting"]["currency"].is_null());
+        assert!(result["posting"]["posting_amount_transaction_currency"].is_null());
+        assert!(result["posting"]["posting_date"].is_null());
+        assert_eq!(server.finish().len(), 3);
+    }
+    let mut responses = payment_setup(payment_line(), payment_journal());
+    responses.push(Response::json(json!({"d":[]})));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let result =
+        serde_json::to_value(backend.get_payment_details(payment_args()).await.unwrap()).unwrap();
+    assert_eq!(result["offset_resolution"], "not_found");
+    assert!(result["offset_line"].is_null());
+    server.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payment_details_reject_invalid_inputs_and_wrong_or_non_cashflow_selected_lines() {
+    let (_directory, backend) = financial_backend(&Url::parse("http://127.0.0.1:1").unwrap()).await;
+    for (account, line) in [
+        ("bad", INVOICE_LINE_ID),
+        (COMPANY_ID, "bad"),
+        ("00000000-0000-0000-0000-000000000000", INVOICE_LINE_ID),
+        (COMPANY_ID, "00000000-0000-0000-0000-000000000000"),
+    ] {
+        let args = serde_json::from_value(json!({"account_id":account,"transaction_line_id":line}))
+            .unwrap();
+        let error = backend.get_payment_details(args).await.err().unwrap();
+        assert!(!format!("{error:#}").contains("request failed"));
+    }
+    for field in [
+        "ID",
+        "Account",
+        "Division",
+        "Type",
+        "EntryID",
+        "EntryNumber",
+        "FinancialYear",
+        "FinancialPeriod",
+        "JournalCode",
+        "OffsetID",
+    ] {
+        let mut row = payment_line();
+        row[field] = match field {
+            "ID" => json!(INVOICE_LINE_ID),
+            "Account" => json!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            "Division" => json!(43),
+            "Type" => json!(20),
+            "EntryID" => json!(uuid::Uuid::nil().to_string()),
+            "EntryNumber" => json!(0),
+            "FinancialYear" => json!(0),
+            "FinancialPeriod" => json!(-1),
+            "JournalCode" => json!(" "),
+            _ => row["ID"].clone(),
+        };
+        let server = Server::new(vec![Response::json(json!({"d":[row]}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.get_payment_details(payment_args()).await.is_err());
+        assert_eq!(server.finish().len(), 1);
+    }
+    for rows in [json!([]), json!([payment_line(), payment_line()])] {
+        let server = Server::new(vec![Response::json(json!({"d":rows}))]);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.get_payment_details(payment_args()).await.is_err());
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payment_details_reject_wrong_or_ambiguous_journals_and_out_of_entry_offset_references() {
+    for field in ["Division", "Code", "ID"] {
+        let mut journal = payment_journal();
+        journal[field] = match field {
+            "Division" => json!(43),
+            "Code" => json!("30"),
+            _ => json!(uuid::Uuid::nil().to_string()),
+        };
+        let server = Server::new(payment_setup(payment_line(), journal));
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.get_payment_details(payment_args()).await.is_err());
+        server.finish();
+    }
+    for rows in [json!([]), json!([payment_journal(), payment_journal()])] {
+        let mut responses = payment_setup(payment_line(), payment_journal());
+        responses[2] = Response::json(json!({"d":rows}));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.get_payment_details(payment_args()).await.is_err());
+        server.finish();
+    }
+    for field in [
+        "ID",
+        "EntryID",
+        "Division",
+        "EntryNumber",
+        "FinancialYear",
+        "FinancialPeriod",
+        "JournalCode",
+    ] {
+        let mut offset = payment_line();
+        offset["ID"] = offset["OffsetID"].clone();
+        offset["OffsetID"] = Value::Null;
+        offset[field] = match field {
+            "ID" => json!(INVOICE_LINE_ID),
+            "EntryID" => json!(INVOICE_ENTRY_ID),
+            "Division" => json!(43),
+            "EntryNumber" => json!(54322),
+            "FinancialYear" => json!(2024),
+            "FinancialPeriod" => json!(11),
+            _ => json!("30"),
+        };
+        let mut responses = payment_setup(payment_line(), payment_journal());
+        responses.push(Response::json(json!({"d":[offset]})));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        assert!(backend.get_payment_details(payment_args()).await.is_err());
+        server.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payment_details_fail_source_errors_without_partial_postings_or_response_bodies() {
+    for (position, status) in [
+        (0, "403 Forbidden"),
+        (2, "403 Forbidden"),
+        (3, "429 Too Many Requests"),
+        (3, "302 Found"),
+    ] {
+        let mut responses = payment_setup(payment_line(), payment_journal());
+        responses.push(Response::json(json!({"d":[]})));
+        responses.truncate(position + 1);
+        responses[position] = Response {
+            status,
+            location: if status.starts_with("302") {
+                Some("https://untrusted.invalid/".into())
+            } else {
+                None
+            },
+            body: "PRIVATE_FINANCIAL_TEXT".into(),
+        };
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let error = backend
+            .get_payment_details(payment_args())
+            .await
+            .err()
+            .unwrap();
+        assert!(!format!("{error:#}").contains("PRIVATE_FINANCIAL_TEXT"));
+        assert_eq!(server.finish().len(), position + 1);
+    }
+}

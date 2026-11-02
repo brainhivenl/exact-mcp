@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 9);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -219,6 +219,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                     | "get_outstanding_balances"
                     | "get_invoice_details"
                     | "get_invoice_matches"
+                    | "get_payment_details"
                     | "list_invoice_documents"
                     | "download_invoice_pdf"
             )
@@ -941,6 +942,63 @@ fn stdio_invoice_search_disambiguates_reused_numbers_for_accounting_drilldown() 
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     assert!(!response.to_string().contains("fixture-access-token"));
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_payment_details_are_read_only_posting_evidence_not_payment_execution() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let api = thread::spawn(move || {
+        let responses = [
+            (
+                "/financialtransaction/TransactionLines?",
+                json!({"d":[{"ID":"77777777-7777-7777-7777-777777777777","EntryID":"99999999-9999-9999-9999-999999999999","Division":42,"Account":ACCOUNT_ID,"EntryNumber":54321,"FinancialYear":2025,"FinancialPeriod":12,"JournalCode":"20","LineNumber":1,"Type":40,"AmountDC":-100,"AmountFC":-120,"Currency":"USD","Date":"2025-12-20","OffsetID":null}]}),
+            ),
+            (
+                "/system/Divisions?",
+                json!({"d":[{"Code":42,"Currency":"EUR"}]}),
+            ),
+            (
+                "/financial/Journals?",
+                json!({"d":[{"ID":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","Division":42,"Code":"20","Type":16,"Description":"Payment service journal","Currency":"EUR","PaymentServiceProviderName":"Provider X"}]}),
+            ),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"));
+            assert!(target.contains(path));
+            assert!(!target.contains("IBAN"));
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response=process.request(2,"tools/call",json!({"name":"get_payment_details","arguments":{"account_id":ACCOUNT_ID,"transaction_line_id":"77777777-7777-7777-7777-777777777777"}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["journal_kind"], "payment_service");
+    assert_eq!(
+        result["journal"]["payment_service_provider_name"],
+        "Provider X"
+    );
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["posting"]["currency"], "USD");
+    assert_eq!(result["posting"]["posting_amount_default_currency"], "-100");
+    assert_eq!(result["offset_resolution"], "not_reported");
+    assert!(
+        result["interpretation"]
+            .as_str()
+            .unwrap()
+            .contains("do not prove payment execution")
+    );
+    assert!(!response.to_string().contains("fixture-access-token"));
+    assert!(!directory.join("downloads").exists());
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     api.join().unwrap();
     process.shutdown();
 }

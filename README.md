@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations, cashflow posting drill-down and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
 
 ## Setup
 
@@ -13,7 +13,7 @@ Use Nix with flakes enabled, or Rust 1.89 or newer.
    https://exact-mcp.localhost:8400/callback
    ```
 
-3. Make sure the authorizing user/app has access to the administrations you need. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries. Invoice accounting drill-down additionally requires **Financial accounting**; it also uses **Organization administration** to resolve the default currency. Existing outstanding-balance tools do not require the additional accounting scope. PDF discovery/download also requires **Organization documents**, and receivable PDF discovery additionally uses **Sales invoices** to resolve the original commercial invoice UUID.
+3. Make sure the authorizing user/app has access to the administrations you need. Setup requires **Organization administration**. Financial tools additionally require **Crm accounts**, **Financial payables**, and **Financial receivables** for the corresponding queries. Invoice accounting drill-down additionally requires **Financial accounting**; it also uses **Organization administration** to resolve the default currency. Existing outstanding-balance tools do not require the additional accounting scope. PDF discovery/download also requires **Organization documents**, and receivable PDF discovery additionally uses **Sales invoices** to resolve the original commercial invoice UUID. Payment drill-down additionally requires **Financial generalledgers** to read journal metadata; existing invoice/matching/search tools do not need this extra journal scope.
 4. With Nix, run the CLI directly (the first invocation builds it):
 
    ```sh
@@ -80,7 +80,7 @@ nix run .#pi
 
 This builds the MCP binary, loads credentials from the environment or the repository's `.env`, registers its exact Nix store path as the project-local `exact` server with direct tool exposure, and starts a fresh interactive Pi session. The secret is inherited through the process environment, not saved in the MCP configuration or requested again at a prompt. Existing Pi credentials, models and user-level configuration are reused unchanged.
 
-The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with eight tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
+The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with nine tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
 
 ### Other MCP clients
 
@@ -110,6 +110,8 @@ Ensure the MCP host can find `nix` and inherits `EXACT_CLIENT_SECRET` for automa
 - `get_invoice_details`: `{ "account_id": "<UUID>", "side": "payable", "entry_number": 12345, "journal_code": "60" }`. Use the account UUID, side, entry number and journal code from the **same** `search_invoices` or `get_open_items` result; include `entry_id` from invoice search when available. Accounting numbers can be reused across years, so the optional UUID disambiguates the exact header while account/number/journal are still checked; the example numbers are placeholders, not values to guess. Returns a purchase (`payable`) or sales (`receivable`) accounting header, all entry lines, both currency contexts and the header's linked-document reference. It does not download documents or determine current open balances.
 
 - `get_invoice_matches`: the same `{ "account_id", "side", "entry_number", "journal_code" }` inputs and optional `entry_id` as `get_invoice_details`, using verified references (including closed invoices). Returns recorded matching groups with signed default-currency allocations and counterpart ledger evidence. Requires XML `MatchSets` download access plus **Crm accounts**, **Financial accounting** and **Organization administration**. This is not a match/unmatch event audit, current open balance, or proof of bank settlement.
+
+- `get_payment_details`: `{ "account_id": "<same verified company UUID>", "transaction_line_id": "<explicitly selected cashflow candidate id>" }`. Use `get_invoice_matches` → `ledger_evidence[].candidates[]`; select a source `type_code: 40` cashflow line and pass its **`id`**, not `entry_id` or a payment-term UUID. Never silently select an ambiguous matching candidate. Returns full posting amounts/currencies, references, posting date, source status/type and current journal metadata. It requires **Financial accounting**, **Financial generalledgers** and **Organization administration**; no payment actions or writes are exposed.
 
 - `list_invoice_documents`: the same `{ "account_id", "side", "entry_number", "journal_code" }` inputs and optional `entry_id` as `get_invoice_details`. Returns linked document types/subjects, association provenance, attachment IDs and filename-only PDF hints without downloading bytes. `invoice_type_match` is true for Exact purchase document type 20 or sales type 10; reminders and other types remain distinguishable and cannot be downloaded as invoices.
 - `download_invoice_pdf`: `{ "invoice": { "account_id": "<UUID>", "side": "payable", "entry_number": 12345, "journal_code": "60" }, "document_id": "<UUID from catalog>", "attachment_id": "<UUID from that document>" }`. Revalidates the selected invoice/document/attachment, downloads one existing PDF and returns its private local path. Never guess IDs or silently pick the first of multiple eligible originals/PDFs.
@@ -211,6 +213,16 @@ Exact's [XML code examples](https://support.exactonline.com/community/s/knowledg
 Live validation covered closed purchase/sales invoices, continuation beyond the initial page, terminal-empty behavior, account/ledger identities and independent agreement with a receipt shown in Exact's UI. Partial, credit, multi-member and ambiguous-line regressions use invented fixtures, not real financial data. REST status 50/zero amounts and `OffsetID` are not used as allocation links: a sampled bank `OffsetID` pointed to its own contra line, not to the invoice. Private probe evidence remains outside the repository.
 
 Exact's [January 2027 XML deprecation notice](https://support.exactonline.com/community/s/knowledge-base#All-All-DNO-Content-breaking-changes-2707-bc-xmlswitchrestapi) lists selected topics only; `MatchSets` is not listed. Monitor future notices rather than assuming every XML topic has a REST equivalent.
+
+### Cashflow posting details
+
+`get_payment_details` validates the requested transaction-line UUID against the selected administration, company UUID and source cashflow type 40. It then reads the journal by its verified code. `journal_kind` comes from documented journal types: 10 cash, 12 bank, 16 payment service; other codes remain `other`. Journal labels/default currency are **current master data**, not historical bank-account ownership or payment-instruction evidence. A line's transaction currency can differ from the journal's default when variable currency is allowed; no currency conversion is performed.
+
+`posting_amount_default_currency` uses `default_currency`; `posting_amount_transaction_currency` uses the line's `currency` (null/blank stays unknown). These are full ledger posting amounts, **not the invoice's allocation**. The tool does not revalidate invoice matching membership, apportion multi-member matching groups, or decide which ambiguous candidate belongs to an allocation. Posting dates are accounting dates, not matching/bank-value/clearing dates. Source status and journal types do not prove payment execution or bank settlement. References and monetary signs are not used to infer a credit, payment direction or invoice relationship.
+
+Only the selected company posting, its journal and at most one explicit `OffsetID` reference are fetched—not the entire bank/cash statement. Any offset must resolve within the same entry UUID, administration, entry number, financial year/period and journal. It can have a different/null account; the source pointer is not a newly inferred company relationship or invoice allocation link. `offset_resolution` distinguishes `resolved_same_entry_reference`, `not_reported` and `not_found`; missing offsets do not imply nonpayment. No bank-account-number/IBAN fields are requested, but descriptions/references can still contain sensitive untrusted text. Source reads are not transactionally frozen.
+
+Live validation checked selected cashflow counterparts from both purchase and sales matching examples: posting identities/amounts, journal metadata and same-entry offsets agreed with existing ledger evidence. Cash/payment-service/unknown journal types, missing offsets, foreign-currency handling and source/scope failures use invented regression fixtures. Real evidence remains private outside the repository.
 
 ### Financial interpretation
 

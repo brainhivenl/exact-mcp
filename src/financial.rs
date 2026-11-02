@@ -387,6 +387,13 @@ impl Backend {
         crate::pdf::download_pdf(&self.client, &self.administration, args).await
     }
 
+    pub async fn get_payment_details(
+        &self,
+        args: crate::payment::GetPaymentDetails,
+    ) -> Result<crate::payment::PaymentDetailsResult> {
+        crate::payment::get_details(&self.client, &self.administration, args).await
+    }
+
     pub async fn get_invoice_matches(
         &self,
         args: crate::invoice::GetInvoiceDetails,

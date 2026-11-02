@@ -4,6 +4,7 @@ mod invoice;
 mod matching;
 mod mcp;
 mod oauth;
+mod payment;
 mod pdf;
 mod store;
 
