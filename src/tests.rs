@@ -70,6 +70,7 @@ struct Request {
     body: String,
 }
 
+#[derive(Clone)]
 struct Response {
     status: &'static str,
     body: String,
@@ -881,12 +882,7 @@ async fn pagination_rejects_other_origins_non_api_paths_and_cycles() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_errors_and_redirects_are_not_retried_or_followed() {
-    for status in [
-        "401 Unauthorized",
-        "403 Forbidden",
-        "429 Too Many Requests",
-        "302 Found",
-    ] {
+    for status in ["401 Unauthorized", "403 Forbidden", "302 Found"] {
         let server = Server::new(vec![Response {
             status,
             body: "old-access financial-data".into(),
@@ -2113,7 +2109,7 @@ async fn outstanding_balances_preserve_decimal_precision_and_reject_global_overf
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outstanding_balances_never_return_partial_totals_on_failed_source_pagination() {
-    let server = Server::new(vec![
+    let mut responses = vec![
         Response::json(
             json!({"d": {"results": [balance_item(1, COMPANY_ID, "1001", "Alpha", "EUR", json!(1))], "__next": "?page=2"}}),
         ),
@@ -2122,7 +2118,9 @@ async fn outstanding_balances_never_return_partial_totals_on_failed_source_pagin
             body: "private financial data".into(),
             location: None,
         },
-    ]);
+    ];
+    responses.extend(std::iter::repeat_n(responses[1].clone(), 2));
+    let server = Server::new(responses);
     let (_directory, backend) = financial_backend(&server.base).await;
     let error = backend
         .get_outstanding_balances(serde_json::from_value(json!({"side": "payable"})).unwrap())
@@ -2131,7 +2129,7 @@ async fn outstanding_balances_never_return_partial_totals_on_failed_source_pagin
         .unwrap();
     assert!(error.to_string().contains("429"));
     assert!(!format!("{error:#}").contains("private financial data"));
-    assert_eq!(server.finish().len(), 2);
+    assert_eq!(server.finish().len(), 4);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3530,6 +3528,8 @@ async fn invoice_matches_reject_cursor_cycles_inconsistent_pages_source_errors_a
     ] {
         let mut responses = matching_setup();
         responses.push(matching_page(&pair, 1, 1, "0x0000000000000001"));
+        let retry_count = if next.status.starts_with("429") { 2 } else { 0 };
+        responses.extend(std::iter::repeat_n(next.clone(), retry_count));
         responses.push(next);
         let server = Server::new(responses);
         let (_directory, backend) = financial_backend(&server.base).await;
@@ -3539,7 +3539,7 @@ async fn invoice_matches_reject_cursor_cycles_inconsistent_pages_source_errors_a
             .err()
             .unwrap();
         assert!(!format!("{error:#}").contains("PRIVATE_FINANCIAL_TEXT"));
-        assert_eq!(server.finish().len(), 6);
+        assert_eq!(server.finish().len(), 6 + retry_count);
     }
 }
 
@@ -4291,6 +4291,11 @@ async fn payment_details_fail_source_errors_without_partial_postings_or_response
             },
             body: "PRIVATE_FINANCIAL_TEXT".into(),
         };
+        let retry_count = if status.starts_with("429") { 2 } else { 0 };
+        responses.extend(std::iter::repeat_n(
+            responses[position].clone(),
+            retry_count,
+        ));
         let server = Server::new(responses);
         let (_directory, backend) = financial_backend(&server.base).await;
         let error = backend
@@ -4299,7 +4304,7 @@ async fn payment_details_fail_source_errors_without_partial_postings_or_response
             .err()
             .unwrap();
         assert!(!format!("{error:#}").contains("PRIVATE_FINANCIAL_TEXT"));
-        assert_eq!(server.finish().len(), position + 1);
+        assert_eq!(server.finish().len(), position + 1 + retry_count);
     }
 }
 
@@ -4541,28 +4546,23 @@ async fn ledger_inputs_are_validated_before_network_and_source_scope_is_enforced
                 .is_err()
         );
     }
-    for field in [
-        "Division",
-        "GLAccount",
-        "GLAccountCode",
-        "FinancialYear",
-        "FinancialPeriod",
-        "Status",
-        "ID",
-        "EntryID",
-        "JournalCode",
+    for (field, value) in [
+        ("Division", json!(43)),
+        ("GLAccount", json!(COMPANY_ID)),
+        ("GLAccountCode", json!("other")),
+        ("FinancialYear", json!(2024)),
+        ("FinancialPeriod", json!(-1)),
+        ("FinancialPeriod", json!(14)),
+        ("Status", json!(20)),
+        ("ID", json!(uuid::Uuid::nil().to_string())),
+        ("EntryID", json!(uuid::Uuid::nil().to_string())),
+        ("EntryNumber", json!(0)),
+        ("EntryNumber", json!(i64::from(i32::MAX) + 1)),
+        ("JournalCode", json!(" ")),
+        ("JournalCode", json!("x".repeat(101))),
     ] {
         let mut row = ledger_line("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa", json!(1), 1, 50);
-        row[field] = match field {
-            "Division" => json!(43),
-            "GLAccount" => json!(COMPANY_ID),
-            "GLAccountCode" => json!("other"),
-            "FinancialYear" => json!(2024),
-            "FinancialPeriod" => json!(14),
-            "Status" => json!(20),
-            "ID" | "EntryID" => json!(uuid::Uuid::nil().to_string()),
-            _ => json!(" "),
-        };
+        row[field] = value;
         let mut responses = ledger_setup();
         responses.push(Response::json(json!({"d":[row]})));
         let server = Server::new(responses);
@@ -4630,4 +4630,146 @@ async fn ledger_missing_amounts_duplicates_failed_paging_and_decimal_overflow_re
         assert!(backend.get_ledger_report(ledger_args()).await.is_err());
         assert_eq!(server.finish().len(), 1);
     }
+}
+
+fn paginated_test_rows(rows: Vec<Value>, page_size: usize) -> Vec<Response> {
+    let page_count = rows.len().div_ceil(page_size);
+    rows.chunks(page_size)
+        .enumerate()
+        .map(|(index, page)| {
+            let mut envelope = json!({"results": page});
+            if index + 1 < page_count {
+                envelope["__next"] = json!(format!("?page={}", index + 2));
+            }
+            Response::json(json!({"d": envelope}))
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_outstanding_summaries_keep_all_page_totals_and_aging() {
+    const COUNT: usize = 10_000;
+    for administration_wide in [false, true] {
+        let rows = (0..COUNT)
+            .map(|index| {
+                if administration_wide {
+                    balance_item(
+                        index as i64,
+                        COMPANY_ID,
+                        "1001",
+                        "Company X",
+                        "EUR",
+                        json!(0.01),
+                    )
+                } else {
+                    open_item(index as i64, "EUR", json!(0.01))
+                }
+            })
+            .collect();
+        let mut responses = Vec::new();
+        if !administration_wide {
+            responses.push(company_response());
+        }
+        responses.extend(paginated_test_rows(rows, 500));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let result = if administration_wide {
+            serde_json::to_value(
+                backend
+                    .get_outstanding_balances(
+                        serde_json::from_value(json!({"side":"payable","limit":1})).unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        } else {
+            let mut args = open_items_args();
+            args.summary_only = true;
+            serde_json::to_value(backend.get_open_items(args).await.unwrap()).unwrap()
+        };
+        assert_eq!(result["source_item_count"], COUNT);
+        assert_eq!(result["matched_item_count"], COUNT);
+        assert_eq!(
+            result["totals_by_currency"]["EUR"]["net_open_amount"],
+            "100.00"
+        );
+        assert_eq!(
+            result["totals_by_currency"]["EUR"]["aging_by_due_date"]["overdue_over_90_days"]["item_count"],
+            COUNT
+        );
+        assert!(result.get("items").is_none());
+        assert_eq!(
+            server.finish().len(),
+            20 + usize::from(!administration_wide)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_ledger_report_keeps_complete_totals_with_small_late_sorted_pages() {
+    const COUNT: usize = 10_000;
+    for summary in [false, true] {
+        let rows = (1..=COUNT)
+            .rev()
+            .map(|index| {
+                let id = uuid::Uuid::from_u128(index as u128).to_string();
+                let mut row = ledger_line(&id, json!(0.01), 1, 50);
+                row["Date"] = json!("2025-01-01");
+                row["LineNumber"] = json!(index);
+                row
+            })
+            .collect();
+        let mut responses = ledger_setup();
+        responses.extend(paginated_test_rows(rows, 500));
+        let server = Server::new(responses);
+        let (_directory, backend) = financial_backend(&server.base).await;
+        let mut args = ledger_args();
+        args.limit = Some(3);
+        args.offset = 100;
+        args.summary_only = summary;
+        let result = serde_json::to_value(backend.get_ledger_report(args).await.unwrap()).unwrap();
+        assert_eq!(result["totals"]["line_count"], COUNT);
+        assert_eq!(result["totals"]["net_movement_default_currency"], "100.00");
+        assert_eq!(result["totals_by_status"]["50"]["line_count"], COUNT);
+        if summary {
+            assert!(result.get("transactions").is_none());
+        } else {
+            assert_eq!(result["transactions"].as_array().unwrap().len(), 3);
+            assert_eq!(result["transactions"][0]["line_number"], 101);
+            assert_eq!(result["transactions"][2]["line_number"], 103);
+            assert_eq!(result["has_more"], true);
+            assert_eq!(result["next_offset"], 103);
+        }
+        assert_eq!(server.finish().len(), 22);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_invoice_search_counts_all_pages_and_retains_correct_latest_window() {
+    const COUNT: usize = 10_000;
+    let rows = (1..=COUNT)
+        .map(|index| {
+            let mut row = invoice_header("payable");
+            row["EntryID"] = json!(uuid::Uuid::from_u128(index as u128).to_string());
+            row["EntryNumber"] = json!(index);
+            row["EntryDate"] = json!("2025-01-01");
+            row
+        })
+        .collect();
+    let mut responses = invoice_search_setup();
+    responses.extend(paginated_test_rows(rows, 500));
+    let server = Server::new(responses);
+    let (_directory, backend) = financial_backend(&server.base).await;
+    let mut args = invoice_search_args("payable");
+    args.limit = Some(3);
+    args.offset = 100;
+    let result = serde_json::to_value(backend.search_invoices(args).await.unwrap()).unwrap();
+    assert_eq!(result["source_entry_count"], COUNT);
+    assert_eq!(result["matched_entry_count"], COUNT);
+    assert_eq!(result["invoices"].as_array().unwrap().len(), 3);
+    assert_eq!(result["invoices"][0]["entry_number"], COUNT - 100);
+    assert_eq!(result["invoices"][2]["entry_number"], COUNT - 102);
+    assert_eq!(result["next_offset"], 103);
+    assert_eq!(server.finish().len(), 22);
 }

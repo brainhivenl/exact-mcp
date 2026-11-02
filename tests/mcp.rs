@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 13);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -214,6 +214,8 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "search_draft_invoices"
+                    | "get_draft_invoice_details"
                     | "search_invoices"
                     | "get_open_items"
                     | "get_outstanding_balances"
@@ -1083,6 +1085,83 @@ fn stdio_gl_lookup_and_period_report_keep_all_page_totals_and_status_breakdowns(
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *report);
     assert!(!response.to_string().contains("fixture-access-token"));
+    api.join().unwrap();
+    process.shutdown();
+}
+
+#[test]
+fn stdio_drafts_are_commercial_read_only_and_distinct_from_posted_invoices() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let invoice_id = "88888888-8888-8888-8888-888888888888";
+    let api = thread::spawn(move || {
+        let account = json!({"ID":ACCOUNT_ID,"Division":42,"Code":"1001","Name":"Company X"});
+        let currency = json!({"Code":42,"Currency":"EUR"});
+        let invoice = json!({"InvoiceID":invoice_id,"Division":42,"InvoiceTo":ACCOUNT_ID,"OrderedBy":"22222222-2222-2222-2222-222222222222","Status":20,"Currency":"USD","InvoiceDate":"2025-01-01","Description":"Draft services","AmountDC":10.5,"AmountFC":12.1,"AmountFCExclVat":10,"VATAmountFC":2.1});
+        let mut processed = invoice.clone();
+        processed["InvoiceID"] = json!("99999999-9999-9999-9999-999999999999");
+        processed["Status"] = json!(50);
+        let line = |id: &str, number| json!({"ID":id,"InvoiceID":invoice_id,"Division":42,"LineNumber":number,"AmountDC":5.25,"AmountFC":5,"VATAmountFC":1.05,"VATPercentage":0.21,"Quantity":1});
+        let responses = [
+            ("/crm/Accounts?", json!({"d":[account.clone()]})),
+            ("/system/Divisions?", json!({"d":[currency.clone()]})),
+            (
+                "/salesinvoice/SalesInvoices?",
+                json!({"d":{"results":[processed],"__next":"?page=2"}}),
+            ),
+            (
+                "/salesinvoice/SalesInvoices?page=2",
+                json!({"d":[invoice.clone()]}),
+            ),
+            ("/crm/Accounts?", json!({"d":[account]})),
+            ("/salesinvoice/SalesInvoices?", json!({"d":[invoice]})),
+            ("/system/Divisions?", json!({"d":[currency]})),
+            (
+                "/salesinvoice/SalesInvoiceLines?",
+                json!({"d":{"results":[line("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",2)],"__next":"?page=2"}}),
+            ),
+            (
+                "/salesinvoice/SalesInvoiceLines?page=2",
+                json!({"d":[line("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",1)]}),
+            ),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"), "{target}");
+            assert!(target.contains(path), "{target}");
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let found = process.request(
+        2,
+        "tools/call",
+        json!({"name":"search_draft_invoices","arguments":{"account_id":ACCOUNT_ID}}),
+    );
+    assert_ne!(found["result"]["isError"], true, "{found}");
+    let search = &found["result"]["structuredContent"];
+    assert_eq!(search["source_invoice_count"], 2);
+    assert_eq!(search["matched_invoice_count"], 1);
+    assert_eq!(search["invoices"][0]["invoice_id"], invoice_id);
+    assert_eq!(search["invoices"][0]["status_code"], 20);
+    assert_eq!(search["company_role"], "invoice_to_bill_to_not_ordered_by");
+    let details = process.request(3,"tools/call",json!({"name":"get_draft_invoice_details","arguments":{"account_id":ACCOUNT_ID,"invoice_id":invoice_id}}));
+    assert_ne!(details["result"]["isError"], true, "{details}");
+    let result = &details["result"]["structuredContent"];
+    assert_eq!(result["default_currency"], "EUR");
+    assert_eq!(result["invoice"]["currency"], "USD");
+    assert_eq!(result["invoice"]["amount_transaction_currency"], "12.1");
+    assert_eq!(result["line_count"], 2);
+    assert_eq!(result["lines"][0]["line_number"], 1);
+    assert_eq!(result["lines"][0]["vat_percentage"], "0.21");
+    assert!(result.get("entry_id").is_none());
+    assert!(result.get("paid_amount").is_none());
+    let text = details["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    assert!(!details.to_string().contains("fixture-access-token"));
     api.join().unwrap();
     process.shutdown();
 }

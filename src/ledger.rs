@@ -154,6 +154,42 @@ struct LedgerLine {
     description: Option<String>,
 }
 
+impl LedgerLine {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.id.is_nil()
+                && !self.entry_id.is_nil()
+                && (1..=i64::from(i32::MAX)).contains(&self.entry_number)
+                && !self.journal_code.trim().is_empty()
+                && self.journal_code.trim().chars().count() <= 100,
+            "Invalid G/L transaction; no totals returned"
+        );
+        Ok(())
+    }
+
+    fn validate_for(
+        &self,
+        division: u32,
+        account: &GlAccount,
+        args: &GetLedgerReport,
+    ) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            self.division == division
+                && self.gl_account_id == account.id
+                && self.financial_year == args.financial_year
+                && (args.period_from..=args.period_to).contains(&self.financial_period)
+                && args.status.is_none_or(|status| self.status_code == status)
+                && self
+                    .gl_account_code
+                    .as_ref()
+                    .is_none_or(|code| code.trim() == account.code.trim()),
+            "Wrong-scope G/L transaction; no totals returned"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Default, Serialize)]
 struct MovementTotals {
     line_count: usize,
@@ -327,57 +363,55 @@ pub(crate) async fn get_report(
     url.query_pairs_mut()
         .append_pair("$select", LINE_FIELDS)
         .append_pair("$filter", &filter);
-    let mut lines: Vec<LedgerLine> = client
-        .get_collection(url)
-        .await
-        .context("Cannot read G/L transactions; check Financial accounting permission")?;
+    let mut lines = BTreeMap::new();
+    let retained_limit = (next_offset as usize).saturating_add(1);
     let mut ids = HashSet::new();
     let mut totals = MovementTotals::default();
     let mut totals_by_status: BTreeMap<i32, MovementTotals> = BTreeMap::new();
-    for line in &lines {
-        ensure!(
-            line.division == administration.code
-                && line.gl_account_id == id
-                && !line.id.is_nil()
-                && !line.entry_id.is_nil()
-                && ids.insert(line.id)
-                && line.financial_year == args.financial_year
-                && (args.period_from..=args.period_to).contains(&line.financial_period)
-                && args.status.is_none_or(|status| line.status_code == status)
-                && (1..=i64::from(i32::MAX)).contains(&line.entry_number)
-                && !line.journal_code.trim().is_empty()
-                && line.journal_code.trim().chars().count() <= 100
-                && line
-                    .gl_account_code
-                    .as_ref()
-                    .is_none_or(|code| code.trim() == account.code.trim()),
-            "Wrong-scope, duplicate or invalid G/L transaction; no totals returned"
-        );
-        totals.add(line.amount_default_currency)?;
-        totals_by_status
-            .entry(line.status_code)
-            .or_default()
-            .add(line.amount_default_currency)?;
-    }
-    lines.sort_by(|left, right| {
-        let left_date = left.posting_date.as_ref().map(|date| date.0);
-        let right_date = right.posting_date.as_ref().map(|date| date.0);
-        left_date
-            .is_none()
-            .cmp(&right_date.is_none())
-            .then_with(|| left_date.cmp(&right_date))
-            .then_with(|| left.journal_code.trim().cmp(right.journal_code.trim()))
-            .then_with(|| left.entry_number.cmp(&right.entry_number))
-            .then_with(|| left.line_number.cmp(&right.line_number))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let has_more = !args.summary_only && lines.len() > next_offset as usize;
+    client
+        .try_for_each_page(url, |page: Vec<LedgerLine>| {
+            for line in page {
+                line.validate_for(administration.code, &account, &args)?;
+                ensure!(
+                    ids.insert(line.id),
+                    "Duplicate G/L transaction; no totals returned"
+                );
+                totals.add(line.amount_default_currency)?;
+                totals_by_status
+                    .entry(line.status_code)
+                    .or_default()
+                    .add(line.amount_default_currency)?;
+                if !args.summary_only {
+                    let date = line.posting_date.as_ref().map(|date| date.0);
+                    let key = (
+                        date.is_none(),
+                        date,
+                        line.journal_code.trim().to_owned(),
+                        line.entry_number,
+                        line.line_number,
+                        line.id,
+                    );
+                    if lines.len() < retained_limit
+                        || lines.last_key_value().is_some_and(|(last, _)| &key < last)
+                    {
+                        if lines.len() == retained_limit {
+                            lines.pop_last();
+                        }
+                        lines.insert(key, line);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .context("Cannot read G/L transactions; check Financial accounting permission")?;
+    let has_more = !args.summary_only && totals.line_count > next_offset as usize;
     let transactions = if args.summary_only {
         None
     } else {
         Some(
             lines
-                .into_iter()
+                .into_values()
                 .skip(args.offset as usize)
                 .take(limit as usize)
                 .collect(),

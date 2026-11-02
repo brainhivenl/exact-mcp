@@ -387,6 +387,20 @@ impl Backend {
         crate::pdf::download_pdf(&self.client, &self.administration, args).await
     }
 
+    pub async fn search_draft_invoices(
+        &self,
+        args: crate::draft::SearchDraftInvoices,
+    ) -> Result<crate::draft::DraftInvoiceSearchResult> {
+        crate::draft::search(&self.client, &self.administration, args).await
+    }
+
+    pub async fn get_draft_invoice_details(
+        &self,
+        args: crate::draft::GetDraftInvoiceDetails,
+    ) -> Result<crate::draft::DraftInvoiceDetailsResult> {
+        crate::draft::get_details(&self.client, &self.administration, args).await
+    }
+
     pub async fn search_gl_accounts(
         &self,
         args: crate::ledger::SearchGlAccounts,
@@ -506,57 +520,62 @@ impl Backend {
             "Account not found uniquely in the selected administration"
         );
         let account = accounts.remove(0);
-        let raw_items: Vec<RawOpenItem> = self.client.get_collection(items_url).await?;
         let current = Local::now();
         let today = current.date_naive();
         let mut totals = BTreeMap::<String, CurrencyTotals>::new();
         let mut ids = HashSet::new();
-        let source_item_count = raw_items.len();
+        let mut source_item_count = 0;
         let mut matched_item_count = 0;
-        let mut items = (!args.summary_only).then(|| Vec::with_capacity(source_item_count));
-        for raw in raw_items {
-            ensure!(
-                raw.account_id == account_id,
-                "Exact returned an item for a different company; no totals returned"
-            );
-            ensure!(
-                ids.insert(raw.hid.clone()),
-                "Exact returned duplicate outstanding items; retry before using totals"
-            );
-            let currency = raw.currency_code.trim().to_owned();
-            ensure!(
-                !currency.is_empty(),
-                "Exact returned an item without a currency; no totals returned"
-            );
-            let due_date = raw.due_date.as_ref().map(|date| date.0);
-            let overdue = due_date.map(|date| date < today);
-            if !filters.matches(due_date, today) {
-                continue;
-            }
-            matched_item_count += 1;
-            totals
-                .entry(currency.clone())
-                .or_default()
-                .add_item(&raw, today)?;
-            if let Some(items) = &mut items {
-                items.push(OpenItem {
-                    hid: raw.hid,
-                    amount: raw.amount,
-                    amount_in_transit: raw.amount_in_transit,
-                    currency,
-                    due_date,
-                    invoice_date: raw.invoice_date.map(|date| date.0),
-                    invoice_number: raw.invoice_number,
-                    entry_number: raw.entry_number,
-                    journal_code: raw.journal_code,
-                    your_ref: raw.your_ref,
-                    description: raw.description,
-                    overdue,
-                    days_overdue: due_date
-                        .map(|date| today.signed_duration_since(date).num_days().max(0)),
-                });
-            }
-        }
+        let mut items = (!args.summary_only).then(Vec::new);
+        self.client
+            .try_for_each_page(items_url, |page: Vec<RawOpenItem>| {
+                source_item_count += page.len();
+                for raw in page {
+                    ensure!(
+                        raw.account_id == account_id,
+                        "Exact returned an item for a different company; no totals returned"
+                    );
+                    ensure!(
+                        ids.insert(raw.hid.clone()),
+                        "Exact returned duplicate outstanding items; retry before using totals"
+                    );
+                    let currency = raw.currency_code.trim().to_owned();
+                    ensure!(
+                        !currency.is_empty(),
+                        "Exact returned an item without a currency; no totals returned"
+                    );
+                    let due_date = raw.due_date.as_ref().map(|date| date.0);
+                    let overdue = due_date.map(|date| date < today);
+                    if !filters.matches(due_date, today) {
+                        continue;
+                    }
+                    matched_item_count += 1;
+                    totals
+                        .entry(currency.clone())
+                        .or_default()
+                        .add_item(&raw, today)?;
+                    if let Some(items) = &mut items {
+                        items.push(OpenItem {
+                            hid: raw.hid,
+                            amount: raw.amount,
+                            amount_in_transit: raw.amount_in_transit,
+                            currency,
+                            due_date,
+                            invoice_date: raw.invoice_date.map(|date| date.0),
+                            invoice_number: raw.invoice_number,
+                            entry_number: raw.entry_number,
+                            journal_code: raw.journal_code,
+                            your_ref: raw.your_ref,
+                            description: raw.description,
+                            overdue,
+                            days_overdue: due_date
+                                .map(|date| today.signed_duration_since(date).num_days().max(0)),
+                        });
+                    }
+                }
+                Ok(())
+            })
+            .await?;
         Ok(OpenItemsResult {
             administration: self.administration.clone(),
             retrieved_at: Utc::now().to_rfc3339(),
@@ -600,63 +619,69 @@ impl Backend {
         };
         let mut url = self.resource_url(resource)?;
         url.query_pairs_mut().append_pair("$select", BALANCE_FIELDS);
-        let rows: Vec<RawAccountOpenItem> = self.client.get_collection(url).await?;
         let current = Local::now();
         let today = current.date_naive();
-        let source_item_count = rows.len();
+        let mut source_item_count = 0;
         let mut matched_item_count = 0;
         let mut totals = BTreeMap::<String, CurrencyTotals>::new();
         let mut accounts = BTreeMap::<Uuid, AccountBalance>::new();
         let mut ids = HashSet::new();
-        for raw in rows {
-            let item = raw.item;
-            ensure!(
-                !item.account_id.is_nil(),
-                "Exact returned an item without an account; no totals returned"
-            );
-            ensure!(
-                ids.insert(item.hid.clone()),
-                "Exact returned duplicate outstanding items; retry before using totals"
-            );
-            ensure!(
-                !raw.account_code.trim().is_empty() && !raw.account_name.trim().is_empty(),
-                "Exact returned incomplete account details; no totals returned"
-            );
-            let currency = item.currency_code.trim().to_owned();
-            ensure!(
-                !currency.is_empty(),
-                "Exact returned an item without a currency; no totals returned"
-            );
-            let account = accounts
-                .entry(item.account_id)
-                .or_insert_with(|| AccountBalance {
-                    account: BalanceAccount {
-                        id: item.account_id,
-                        code: raw.account_code.clone(),
-                        name: raw.account_name.clone(),
-                    },
-                    totals_by_currency: BTreeMap::new(),
-                });
-            ensure!(
-                account.account.code == raw.account_code
-                    && account.account.name == raw.account_name,
-                "Exact returned inconsistent account details; retry before using totals"
-            );
-            let due_date = item.due_date.as_ref().map(|date| date.0);
-            if !filters.matches(due_date, today) {
-                continue;
-            }
-            matched_item_count += 1;
-            totals
-                .entry(currency.clone())
-                .or_default()
-                .add_item(&item, today)?;
-            account
-                .totals_by_currency
-                .entry(currency)
-                .or_default()
-                .add_item(&item, today)?;
-        }
+        self.client
+            .try_for_each_page(url, |page: Vec<RawAccountOpenItem>| {
+                source_item_count += page.len();
+                for raw in page {
+                    let item = raw.item;
+                    ensure!(
+                        !item.account_id.is_nil(),
+                        "Exact returned an item without an account; no totals returned"
+                    );
+                    ensure!(
+                        ids.insert(item.hid.clone()),
+                        "Exact returned duplicate outstanding items; retry before using totals"
+                    );
+                    ensure!(
+                        !raw.account_code.trim().is_empty() && !raw.account_name.trim().is_empty(),
+                        "Exact returned incomplete account details; no totals returned"
+                    );
+                    let currency = item.currency_code.trim().to_owned();
+                    ensure!(
+                        !currency.is_empty(),
+                        "Exact returned an item without a currency; no totals returned"
+                    );
+                    let account =
+                        accounts
+                            .entry(item.account_id)
+                            .or_insert_with(|| AccountBalance {
+                                account: BalanceAccount {
+                                    id: item.account_id,
+                                    code: raw.account_code.clone(),
+                                    name: raw.account_name.clone(),
+                                },
+                                totals_by_currency: BTreeMap::new(),
+                            });
+                    ensure!(
+                        account.account.code == raw.account_code
+                            && account.account.name == raw.account_name,
+                        "Exact returned inconsistent account details; retry before using totals"
+                    );
+                    let due_date = item.due_date.as_ref().map(|date| date.0);
+                    if !filters.matches(due_date, today) {
+                        continue;
+                    }
+                    matched_item_count += 1;
+                    totals
+                        .entry(currency.clone())
+                        .or_default()
+                        .add_item(&item, today)?;
+                    account
+                        .totals_by_currency
+                        .entry(currency)
+                        .or_default()
+                        .add_item(&item, today)?;
+                }
+                Ok(())
+            })
+            .await?;
         let source_account_count = accounts.len();
         let mut accounts: Vec<_> = accounts
             .into_values()

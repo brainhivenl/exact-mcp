@@ -24,3 +24,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net",
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

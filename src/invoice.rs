@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{NaiveDate, Utc};
@@ -331,66 +332,80 @@ pub(crate) async fn search(
     url.query_pairs_mut()
         .append_pair("$select", &format!("{HEADER_FIELDS},{party},{party}Name"))
         .append_pair("$filter", &format!("{party} eq guid'{account_id}'"));
-    let mut entries: Vec<InvoiceEntry> = client.get_collection(url).await.context(
-        "Cannot search invoice accounting entries; check Financial accounting permission",
-    )?;
-    let source_entry_count = entries.len();
+    let mut entries = BTreeMap::new();
+    let retained_limit = (next_offset as usize).saturating_add(1);
+    let mut source_entry_count = 0;
+    let mut matched_entry_count = 0;
     let mut ids = HashSet::new();
-    for entry in &mut entries {
-        entry.currency = entry.currency.trim().to_owned();
-        ensure!(
-            entry.division == administration.code
-                && entry.account_id == account_id
-                && !entry.entry_id.is_nil()
-                && (1..=i64::from(i32::MAX)).contains(&entry.entry_number)
-                && !entry.journal_code.trim().is_empty()
-                && entry.journal_code.trim().chars().count() <= 100
-                && !entry.currency.is_empty(),
-            "Wrong-scope or invalid invoice search entry; no results returned"
-        );
-        ensure!(
-            ids.insert(entry.entry_id),
-            "Duplicate invoice search entries; retry before using results"
-        );
-    }
     let needle = query.map(str::to_lowercase);
-    entries.retain(|entry| {
-        let date = entry.entry_date.as_ref().map(|value| value.0);
-        let dates_match = args
-            .entry_date_from
-            .is_none_or(|from| date.is_some_and(|value| value >= from))
-            && args
-                .entry_date_to
-                .is_none_or(|to| date.is_some_and(|value| value <= to));
-        let text_matches = needle.as_ref().is_none_or(|needle| {
-            entry
-                .your_ref
-                .as_ref()
-                .is_some_and(|value| value.to_lowercase().contains(needle))
-                || entry
-                    .description
-                    .as_ref()
-                    .is_some_and(|value| value.to_lowercase().contains(needle))
-                || entry.entry_number.to_string() == *needle
-                || entry
-                    .invoice_number
-                    .is_some_and(|value| value.to_string() == *needle)
-        });
-        dates_match && text_matches
-    });
-    entries.sort_by(|left, right| {
-        right
-            .entry_date
-            .as_ref()
-            .map(|value| value.0)
-            .cmp(&left.entry_date.as_ref().map(|value| value.0))
-            .then_with(|| right.entry_number.cmp(&left.entry_number))
-            .then_with(|| left.journal_code.trim().cmp(right.journal_code.trim()))
-            .then_with(|| left.entry_id.cmp(&right.entry_id))
-    });
-    let matched_entry_count = entries.len();
+    client
+        .try_for_each_page(url, |page: Vec<InvoiceEntry>| {
+            source_entry_count += page.len();
+            for mut entry in page {
+                entry.currency = entry.currency.trim().to_owned();
+                ensure!(
+                    entry.division == administration.code
+                        && entry.account_id == account_id
+                        && !entry.entry_id.is_nil()
+                        && (1..=i64::from(i32::MAX)).contains(&entry.entry_number)
+                        && !entry.journal_code.trim().is_empty()
+                        && entry.journal_code.trim().chars().count() <= 100
+                        && !entry.currency.is_empty(),
+                    "Wrong-scope or invalid invoice search entry; no results returned"
+                );
+                ensure!(
+                    ids.insert(entry.entry_id),
+                    "Duplicate invoice search entries; retry before using results"
+                );
+                let date = entry.entry_date.as_ref().map(|value| value.0);
+                let dates_match = args
+                    .entry_date_from
+                    .is_none_or(|from| date.is_some_and(|value| value >= from))
+                    && args
+                        .entry_date_to
+                        .is_none_or(|to| date.is_some_and(|value| value <= to));
+                let text_matches = needle.as_ref().is_none_or(|needle| {
+                    entry
+                        .your_ref
+                        .as_ref()
+                        .is_some_and(|value| value.to_lowercase().contains(needle))
+                        || entry
+                            .description
+                            .as_ref()
+                            .is_some_and(|value| value.to_lowercase().contains(needle))
+                        || entry.entry_number.to_string() == *needle
+                        || entry
+                            .invoice_number
+                            .is_some_and(|value| value.to_string() == *needle)
+                });
+                if dates_match && text_matches {
+                    matched_entry_count += 1;
+                    let key = (
+                        Reverse(date),
+                        Reverse(entry.entry_number),
+                        entry.journal_code.trim().to_owned(),
+                        entry.entry_id,
+                    );
+                    if entries.len() < retained_limit
+                        || entries
+                            .last_key_value()
+                            .is_some_and(|(last, _)| &key < last)
+                    {
+                        if entries.len() == retained_limit {
+                            entries.pop_last();
+                        }
+                        entries.insert(key, entry);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .context(
+            "Cannot search invoice accounting entries; check Financial accounting permission",
+        )?;
     let invoices: Vec<_> = entries
-        .into_iter()
+        .into_values()
         .skip(args.offset as usize)
         .take(limit as usize)
         .collect();

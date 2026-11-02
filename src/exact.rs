@@ -1,14 +1,22 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use reqwest::{Client, Url};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::{Client, Response, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio_util::task::TaskTracker;
 
 use crate::oauth;
 use crate::store::{Administration, Session, Store};
+
+#[cfg(test)]
+mod tests;
+
+const MAX_RATE_LIMIT_RETRIES: usize = 2;
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct ExactClient {
@@ -170,27 +178,9 @@ impl ExactClient {
             .append_pair("ID", &attachment_id.to_string())
             .append_pair("_Division_", &division.to_string())
             .append_pair("Download", "1");
-        let token = self.access_token().await?;
-        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
         let mut response = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/pdf")
-            .send()
-            .await
-            .context("Exact PDF download request failed")?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("Exact rejected authorization; run `exact-mcp auth login` again");
-        }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            bail!("Exact API rate limit reached (HTTP 429); wait before trying again");
-        }
-        ensure!(
-            status.is_success(),
-            "Exact PDF download request failed (HTTP {status})"
-        );
+            .get_response(url, "application/pdf", "Exact PDF download request failed")
+            .await?;
         ensure!(
             response
                 .content_length()
@@ -236,27 +226,13 @@ impl ExactClient {
         if let Some(cursor) = cursor {
             url.query_pairs_mut().append_pair("TSPaging", cursor);
         }
-        let token = self.access_token().await?;
-        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
         let mut response = self
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/xml")
-            .send()
-            .await
-            .context("Exact matching export request failed")?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("Exact rejected authorization; run `exact-mcp auth login` again");
-        }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            bail!("Exact API rate limit reached (HTTP 429); wait before trying again");
-        }
-        ensure!(
-            status.is_success(),
-            "Exact matching export request failed (HTTP {status})"
-        );
+            .get_response(
+                url,
+                "application/xml",
+                "Exact matching export request failed",
+            )
+            .await?;
         ensure!(
             response
                 .content_length()
@@ -309,15 +285,43 @@ impl ExactClient {
         self.read_collection(url, offset, Some(limit)).await
     }
 
+    pub(crate) async fn try_for_each_page<T: DeserializeOwned, F: FnMut(Vec<T>) -> Result<()>>(
+        &self,
+        url: Url,
+        mut visit: F,
+    ) -> Result<()> {
+        self.visit_pages(url, |rows| {
+            visit(rows)?;
+            Ok(true)
+        })
+        .await
+    }
+
     async fn read_collection<T: DeserializeOwned>(
         &self,
-        mut url: Url,
+        url: Url,
         mut offset: usize,
         limit: Option<usize>,
     ) -> Result<Vec<T>> {
+        let mut results = Vec::new();
+        self.visit_pages(url, |rows| {
+            let skipped = offset.min(rows.len());
+            offset -= skipped;
+            let remaining = limit.map_or(usize::MAX, |limit| limit - results.len());
+            results.extend(rows.into_iter().skip(skipped).take(remaining));
+            Ok(!limit.is_some_and(|limit| results.len() == limit))
+        })
+        .await?;
+        Ok(results)
+    }
+
+    async fn visit_pages<T: DeserializeOwned, F: FnMut(Vec<T>) -> Result<bool>>(
+        &self,
+        mut url: Url,
+        mut visit: F,
+    ) -> Result<()> {
         let resource_path = url.path().to_owned();
         let mut seen = HashSet::new();
-        let mut results = Vec::new();
         loop {
             ensure!(
                 url.origin() == self.base_url.origin()
@@ -332,28 +336,9 @@ impl ExactClient {
                 seen.insert(url.to_string()),
                 "Exact returned a pagination loop"
             );
-            ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
-            let token = self.access_token().await?;
-            ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
             let response = self
-                .http
-                .get(url.clone())
-                .bearer_auth(token)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .send()
-                .await
-                .context("Exact API request failed")?;
-            let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                bail!("Exact rejected authorization; run `exact-mcp auth login` again");
-            }
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                bail!("Exact API rate limit reached (HTTP 429); wait before trying again");
-            }
-            ensure!(
-                status.is_success(),
-                "Exact API request failed (HTTP {status})"
-            );
+                .get_response(url.clone(), "application/json", "Exact API request failed")
+                .await?;
             let page: Envelope<T> = response
                 .json()
                 .await
@@ -362,19 +347,140 @@ impl ExactClient {
                 Page::Rows(rows) => (rows, None),
                 Page::Paged { results, next } => (results, next),
             };
-            let skipped = offset.min(rows.len());
-            offset -= skipped;
-            let remaining = limit.map_or(usize::MAX, |limit| limit - results.len());
-            results.extend(rows.into_iter().skip(skipped).take(remaining));
-            if limit.is_some_and(|limit| results.len() == limit) {
-                return Ok(results);
+            if !visit(rows)? {
+                return Ok(());
             }
             match next {
                 Some(next) => url = url.join(&next).context("Invalid Exact pagination URL")?,
-                None => return Ok(results),
+                None => return Ok(()),
             }
         }
     }
+
+    async fn get_response(
+        &self,
+        url: Url,
+        accept: &'static str,
+        failure: &'static str,
+    ) -> Result<Response> {
+        let mut waited = Duration::ZERO;
+        let mut delay = None;
+        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+            let response = self
+                .send_get_after(url.clone(), accept, failure, delay)
+                .await?;
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                bail!("Exact rejected authorization; run `exact-mcp auth login` again");
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                delay = bounded_rate_limit_delay(
+                    response.headers(),
+                    SystemTime::now(),
+                    attempt,
+                    waited,
+                );
+                drop(response);
+                waited += delay
+                    .context("Exact API rate limit reached (HTTP 429); wait before trying again")?;
+                continue;
+            }
+            ensure!(status.is_success(), "{failure} (HTTP {status})");
+            return Ok(response);
+        }
+        bail!("Exact API rate limit reached (HTTP 429); wait before trying again")
+    }
+
+    async fn send_get_after(
+        &self,
+        url: Url,
+        accept: &'static str,
+        failure: &'static str,
+        delay: Option<Duration>,
+    ) -> Result<Response> {
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let token = self.access_token().await?;
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        self.http
+            .get(url)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, accept)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!(failure))
+    }
+}
+
+fn bounded_rate_limit_delay(
+    headers: &HeaderMap,
+    now: SystemTime,
+    attempt: usize,
+    waited: Duration,
+) -> Option<Duration> {
+    if attempt >= MAX_RATE_LIMIT_RETRIES {
+        return None;
+    }
+    let delay = rate_limit_delay(headers, now, attempt);
+    (delay <= MAX_RATE_LIMIT_WAIT.saturating_sub(waited)).then_some(delay)
+}
+
+fn rate_limit_delay(headers: &HeaderMap, now: SystemTime, attempt: usize) -> Duration {
+    let mut delay = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| retry_after_delay(value, now));
+    for (reset, remaining) in [
+        ("x-ratelimit-reset", "x-ratelimit-remaining"),
+        (
+            "x-ratelimit-minutely-reset",
+            "x-ratelimit-minutely-remaining",
+        ),
+    ] {
+        if headers.get(remaining).is_some_and(|value| value != "0") {
+            continue;
+        }
+        let reset_delay = headers
+            .get(reset)
+            .and_then(|value| value.to_str().ok())
+            .and_then(decimal_integer)
+            .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)))
+            .map(|reset| reset.duration_since(now).unwrap_or(Duration::ZERO));
+        if let Some(reset_delay) = reset_delay {
+            delay = Some(delay.map_or(reset_delay, |delay| delay.max(reset_delay)));
+        }
+    }
+    delay.unwrap_or(Duration::from_secs(1 + attempt as u64))
+}
+
+fn decimal_integer(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    if let Some(seconds) = decimal_integer(value) {
+        return Some(Duration::from_secs(seconds));
+    }
+    let timestamp = chrono::DateTime::parse_from_rfc2822(value)
+        .map(|date| date.timestamp())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT")
+                .map(|date| date.and_utc().timestamp())
+        })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+                .map(|date| date.and_utc().timestamp())
+        })
+        .ok()?;
+    let seconds = u64::try_from(timestamp).unwrap_or(0);
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))
+        .map(|date| date.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
 #[derive(Deserialize)]
