@@ -78,10 +78,10 @@ pub struct Record<T> {
     #[serde(rename(deserialize = "ID"))]
     id: Uuid,
     division: u32,
-    code: String,
+    pub(crate) code: String,
     description: Option<String>,
     #[serde(flatten)]
-    details: T,
+    pub(crate) details: T,
 }
 
 impl<T> Record<T> {
@@ -114,7 +114,7 @@ pub struct SearchResult<T> {
     resource_interpretation: &'static str,
 }
 
-async fn load_catalog<T: DeserializeOwned>(
+pub(crate) async fn load_catalog<T: DeserializeOwned>(
     client: &ExactClient,
     administration: &Administration,
     endpoint: &str,
@@ -196,10 +196,10 @@ async fn search_result<T>(
 #[serde(rename_all(deserialize = "PascalCase"))]
 pub struct VatCode {
     #[serde(rename(deserialize = "Type"))]
-    calculation_type: Option<String>,
+    pub(crate) calculation_type: Option<String>,
     #[serde(rename(deserialize = "VATTransactionType"))]
-    transaction_type: Option<String>,
-    is_blocked: Option<bool>,
+    pub(crate) transaction_type: Option<String>,
+    pub(crate) is_blocked: Option<bool>,
     charged: Option<bool>,
     calculation_basis: Option<u8>,
     tax_return_type: Option<i16>,
@@ -230,7 +230,7 @@ struct VatPercentage {
     percentage: Option<serde_json::Number>,
 }
 
-async fn load_vat_codes(
+pub(crate) async fn load_vat_codes(
     client: &ExactClient,
     administration: &Administration,
 ) -> Result<Vec<Record<VatCode>>> {
@@ -357,7 +357,7 @@ pub async fn search_payment_conditions(
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
 pub struct CostDimension {
-    end_date: Option<ExactDate>,
+    pub(crate) end_date: Option<ExactDate>,
 }
 
 pub async fn search_cost_centers(
@@ -571,6 +571,18 @@ pub struct JournalPeriodStatusResult {
     periods: Vec<PeriodWithStatus>,
     statuses_without_period_dates: Vec<JournalPeriodStatus>,
     interpretation: &'static str,
+}
+
+impl JournalPeriodStatusResult {
+    pub(crate) fn journal_blocked(&self) -> Option<bool> {
+        self.journal.details.is_blocked
+    }
+    pub(crate) fn period_state(&self, period: i32) -> Option<&'static str> {
+        self.periods
+            .iter()
+            .find(|row| row.period.financial_period == period)
+            .map(|row| row.journal_period_state)
+    }
 }
 
 pub async fn get_journal_period_status(

@@ -5086,3 +5086,6 @@ mod purchase_duplicate_tests;
 
 #[path = "master_data/preflight_tests.rs"]
 mod purchase_preflight_tests;
+
+#[path = "bank/proposal_tests.rs"]
+mod bank_proposal_tests;

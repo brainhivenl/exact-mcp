@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 33);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -217,6 +217,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "propose_bank_transaction_handling"
                     | "preflight_purchase_booking"
                     | "assess_purchase_duplicates"
                     | "search_purchase_documents"
@@ -272,6 +273,31 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                 .is_some_and(|required| required.contains(&json!("query")))
         );
     }
+    let bank_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "propose_bank_transaction_handling")
+        .unwrap()["inputSchema"];
+    assert_eq!(bank_schema["additionalProperties"], false);
+    for field in ["bank_transaction_line_id", "pending_posting_line_id"] {
+        assert!(
+            bank_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
+        );
+    }
+    assert_eq!(
+        bank_schema["$defs"]["InvoiceAllocation"]["properties"]["amount"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bank_schema["$defs"]["GlSplit"]["properties"]["net_amount"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bank_schema["$defs"]["GlSplit"]["additionalProperties"],
+        false
+    );
     let preflight_schema = &tools
         .iter()
         .find(|tool| tool["name"] == "preflight_purchase_booking")
@@ -2084,6 +2110,113 @@ fn stdio_purchase_preflight_reports_evidence_unknowns_and_blockers_without_booki
     assert_eq!(
         response["result"]["structuredContent"]["proposal"]["gross_amount_transaction_currency"],
         "120.99"
+    );
+    api.join().unwrap();
+    process.shutdown();
+    assert!(!directory.join("downloads").exists());
+}
+
+#[test]
+fn stdio_bank_handling_proposal_checks_explicit_invoice_selection_without_financial_actions() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let id = |n| uuid::Uuid::from_u128(n).to_string();
+    let control = id(101);
+    let pending = id(201);
+    let unassigned = id(10);
+    let entry = id(401);
+    let api_control = control.clone();
+    let api_pending = pending.clone();
+    let api_unassigned = unassigned.clone();
+    let api_entry = entry.clone();
+    let api = thread::spawn(move || {
+        let line = |uuid: &str, gl: u128, offset: Option<&str>, amount: i32| json!({"ID":uuid,"EntryID":id(1001),"Division":42,"Account":null,"EntryNumber":1001,"FinancialYear":2025,"FinancialPeriod":1,"JournalCode":"B1","GLAccount":id(gl),"LineNumber":1,"Type":40,"Status":50,"AmountDC":amount,"AmountFC":amount,"Currency":"EUR","Description":"Pay INV-001","OffsetID":offset});
+        let bank = line(&api_control, 11, None, -121);
+        let posting = line(&api_pending, 10, Some(&api_control), 121);
+        for _ in 0..2 {
+            let responses = [
+                (
+                    "/system/Divisions?",
+                    json!({"d":[{"Code":42,"Currency":"EUR"}]}),
+                ),
+                (
+                    "/financial/Journals?",
+                    json!({"d":[{"ID":id(1),"Division":42,"Code":"B1","Type":12,"GLAccount":id(11)}]}),
+                ),
+                (
+                    "/financial/GLAccounts?",
+                    json!({"d":[{"ID":api_unassigned,"Division":42,"Code":"UNASSIGNED","Type":90}]}),
+                ),
+                (
+                    "/financialtransaction/TransactionLines?",
+                    json!({"d":[posting]}),
+                ),
+                (
+                    "/read/financial/PayablesList?",
+                    json!({"d":[{"HID":1,"AccountId":ACCOUNT_ID,"EntryNumber":3001,"JournalCode":"P1","Amount":121,"AmountInTransit":0,"CurrencyCode":"EUR"}]}),
+                ),
+                ("/read/financial/ReceivablesList?", json!({"d":[]})),
+                (
+                    "/financialtransaction/TransactionLines?",
+                    json!({"d":[bank]}),
+                ),
+                (
+                    "/financialtransaction/TransactionLines?",
+                    json!({"d":[bank,posting]}),
+                ),
+                (
+                    "/crm/Accounts?",
+                    json!({"d":[{"ID":ACCOUNT_ID,"Division":42,"Code":"SUP","Name":"Invented supplier"}]}),
+                ),
+                (
+                    "/purchaseentry/PurchaseEntries?",
+                    json!({"d":[{"EntryID":api_entry,"Division":42,"Supplier":ACCOUNT_ID,"EntryNumber":3001,"Journal":"P1","Currency":"EUR","YourRef":"INV-001"}]}),
+                ),
+            ];
+            for (resource, body) in responses {
+                let (mut stream, target) = accept_request(&listener);
+                assert!(
+                    target.starts_with("GET /api/v1/42/") && target.contains(resource),
+                    "{target}"
+                );
+                send_response(&mut stream, body);
+            }
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let mut args = json!({"bank_transaction_line_id":control,"pending_posting_line_id":pending,"unassigned_gl_account_ids":[unassigned],"account_ids":[ACCOUNT_ID]});
+    let first = process.request(
+        2,
+        "tools/call",
+        json!({"name":"propose_bank_transaction_handling","arguments":args.clone()}),
+    );
+    assert_ne!(first["result"]["isError"], true, "{first}");
+    let data = &first["result"]["structuredContent"];
+    assert_eq!(data["candidate_group_count"], 1);
+    assert_eq!(data["authorizes_handling"], false);
+    assert_eq!(data["allocation_evidence"], json!([]));
+    assert_eq!(data["budget"]["residual"], "121");
+    args["invoice_allocations"] = json!([{"account_id":ACCOUNT_ID,"side":"payable","entry_id":entry,"open_item_id":"1","amount":"121.00"}]);
+    let second = process.request(
+        3,
+        "tools/call",
+        json!({"name":"propose_bank_transaction_handling","arguments":args}),
+    );
+    assert_ne!(second["result"]["isError"], true, "{second}");
+    let data = &second["result"]["structuredContent"];
+    assert_eq!(data["status"], "review_required");
+    assert_eq!(data["budget"]["exact_totals_match"], true);
+    assert_eq!(data["authorizes_handling"], false);
+    assert!(!data["unknowns"].as_array().unwrap().is_empty());
+    assert!(data.get("write_payload").is_none());
+    assert!(!second.to_string().contains("fixture-access-token"));
+    assert_eq!(
+        serde_json::from_str::<Value>(second["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap(),
+        *data
     );
     api.join().unwrap();
     process.shutdown();

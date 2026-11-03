@@ -544,6 +544,13 @@ impl Backend {
         crate::ledger::get_report(&self.client, &self.administration, args).await
     }
 
+    pub async fn propose_bank_transaction_handling(
+        &self,
+        args: crate::bank::ProposeBankTransactionHandling,
+    ) -> Result<crate::bank::BankHandlingProposal> {
+        crate::bank::propose(&self.client, &self.administration, args).await
+    }
+
     pub async fn get_bank_transactions_to_handle(
         &self,
         args: crate::bank::GetBankTransactionsToHandle,
@@ -901,6 +908,16 @@ impl Money {
             .map_err(|_| anyhow::anyhow!("Financial product exceeds exact decimal precision"))
     }
 
+    pub(crate) fn magnitude(self) -> Self {
+        Self(self.0.abs())
+    }
+
+    pub(crate) fn difference(self, other: Self) -> Result<Self> {
+        let mut result = self;
+        result.add(Self(-other.0))?;
+        Ok(result)
+    }
+
     pub(crate) fn same_magnitude(self, other: Self) -> bool {
         self.0.abs() == other.0.abs()
     }
@@ -941,7 +958,7 @@ impl<'de> Deserialize<'de> for Money {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ExactDate(pub(crate) NaiveDate);
 
 impl<'de> Deserialize<'de> for ExactDate {

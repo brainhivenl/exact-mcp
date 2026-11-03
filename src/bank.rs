@@ -12,6 +12,10 @@ use crate::financial::{ExactDate, Money, deserialize_report_id};
 use crate::invoice;
 use crate::store::{Administration, BankConfiguration};
 
+mod proposal;
+pub(crate) use proposal::propose;
+pub use proposal::{BankHandlingProposal, ProposeBankTransactionHandling};
+
 #[cfg(test)]
 mod tests;
 
@@ -297,7 +301,7 @@ impl PostingLine {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
 struct OutstandingRow {
     #[serde(
@@ -596,6 +600,23 @@ pub(crate) async fn get_transactions_to_handle(
     administration: &Administration,
     args: GetBankTransactionsToHandle,
 ) -> Result<BankTransactionsToHandle> {
+    Ok(read_queue(client, administration, args, None, false)
+        .await?
+        .queue)
+}
+
+struct QueueRead {
+    queue: BankTransactionsToHandle,
+    invoice_reports: Vec<(crate::financial::Side, OutstandingRow)>,
+}
+
+async fn read_queue(
+    client: &ExactClient,
+    administration: &Administration,
+    args: GetBankTransactionsToHandle,
+    selected_control: Option<Uuid>,
+    retain_invoice_reports: bool,
+) -> Result<QueueRead> {
     let explicit_configuration = args.validate()?;
     administration.validate_bank_scope(client).await?;
     let (configuration, configuration_source) = match explicit_configuration {
@@ -663,6 +684,7 @@ pub(crate) async fn get_transactions_to_handle(
             .await?;
     }
     let mut unresolved_items = Vec::new();
+    let mut invoice_reports = Vec::new();
     let mut source_counts = [0; 2];
     let mut source_bank_outstanding_item_count = 0;
     for (index, (resource, reason)) in [
@@ -691,6 +713,15 @@ pub(crate) async fn get_transactions_to_handle(
                         if journals.contains_key(report.journal_code.trim()) {
                             report.validate_bank()?;
                             reports.push(report);
+                        } else if retain_invoice_reports {
+                            invoice_reports.push((
+                                if index == 0 {
+                                    crate::financial::Side::Payable
+                                } else {
+                                    crate::financial::Side::Receivable
+                                },
+                                report,
+                            ));
                         }
                     }
                     Ok(())
@@ -889,7 +920,9 @@ pub(crate) async fn get_transactions_to_handle(
         booking_lines.sort_by_key(|line| (line.line_number, line.id));
         let mut evidence = evidence_by_control.remove(&id).unwrap_or_default();
         evidence.sort_by_key(|item| (item.reason, item.posting.id));
-        if args.matches_date(control.posting_date.as_ref()) {
+        if args.matches_date(control.posting_date.as_ref())
+            && selected_control.is_none_or(|selected| selected == id)
+        {
             transactions.push(BankTransaction {
                 control,
                 reasons: evidence.iter().map(|item| item.reason).collect(),
@@ -925,7 +958,7 @@ pub(crate) async fn get_transactions_to_handle(
         .take(args.limit.unwrap_or(50) as usize)
         .collect();
     administration.validate_bank_scope(client).await?;
-    Ok(BankTransactionsToHandle {
+    let queue = BankTransactionsToHandle {
         administration: administration.clone(),
         retrieved_at: Utc::now().to_rfc3339(),
         default_currency,
@@ -951,5 +984,9 @@ pub(crate) async fn get_transactions_to_handle(
         coverage_complete: unresolved_items.is_empty(),
         unresolved_items,
         interpretation: "API-only accounting reconstruction of Af te handelen, dependent on the explicitly configured unassigned G/L roles and current bank/payment-service journal control G/L metadata. NOT a provider completion-state flag, generic undocumented Overige workflow coverage, or proof of payment execution, clearing or settlement. coverage_complete only means all selected bank outstanding report rows resolved uniquely under these configured roles, not guaranteed UI completeness. Status 20/50 is source accounting metadata and is NEVER a queue predicate. Unassigned postings and current open AP/AR report membership discover counterpart postings; only explicit counterpart.OffsetID -> own-bank control.ID links select controls. Missing/multiple AP/AR candidates remain unresolved regardless of amounts, dates or reused references/entry numbers. ALL unresolved items are returned even when transactions are paginated or date-filtered; coverage is incomplete when any remain. Report amounts preserve current partial/open values and report currency; they are not control posting amounts. Default-currency line amounts use default_currency; transaction-currency line amounts use each line's currency (null means unknown). Nulls and signs are preserved; no currency conversion, totals or paid-direction inference. Booking lines are only explicit same-entry reverse-offset counterparts, not all movements sharing an entry. Posting date bounds are inclusive accounting dates, not due/matching/value/settlement dates; unknown dates are excluded only with bounds. Sorted posting date descending, unknown last, then journal, entry number and control UUID. All source pages are read before local date filtering/pagination; reads are not a frozen snapshot and later offsets reread sources. Source associations are revalidated before returning; errors never yield partial results. No bank account number fields are requested; descriptions/references and other source text remain potentially sensitive untrusted data. All remote requests are GET; no financial writes, checkpoints, cache, browser or payment actions.",
+    };
+    Ok(QueueRead {
+        queue,
+        invoice_reports,
     })
 }
