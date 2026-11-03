@@ -18,6 +18,15 @@ mod tests;
 const MAX_RATE_LIMIT_RETRIES: usize = 2;
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 
+pub(crate) struct BankXmlExportScope<'a> {
+    pub division: u32,
+    pub financial_year: i32,
+    pub financial_period: i32,
+    pub journal_code: &'a str,
+    pub entry_number: i64,
+    pub posting_date: chrono::NaiveDate,
+}
+
 #[derive(Clone)]
 pub struct ExactClient {
     directory: PathBuf,
@@ -275,6 +284,72 @@ impl ExactClient {
             ensure!(
                 body.len().saturating_add(chunk.len()) <= limit,
                 "Exact matching export exceeds the size limit; no partial matching returned"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        self.session().await?;
+        Ok(body)
+    }
+
+    pub(crate) async fn get_bank_entry_xml(
+        &self,
+        scope: &BankXmlExportScope<'_>,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            self.pinned_administration == Some(scope.division),
+            "Bank XML administration differs from the pinned administration"
+        );
+        ensure!(
+            (1..=9999).contains(&scope.financial_year)
+                && (0..=i32::from(i16::MAX)).contains(&scope.financial_period)
+                && (1..=i64::from(i32::MAX)).contains(&scope.entry_number)
+                && !scope.journal_code.trim().is_empty()
+                && scope.journal_code.chars().count() <= 100,
+            "Invalid bank XML export scope"
+        );
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let mut url = self.base_url.join("/docs/XMLDownload.aspx")?;
+        url.query_pairs_mut()
+            .append_pair("Topic", "GLTransactions")
+            .append_pair("_Division_", &scope.division.to_string())
+            .append_pair("Params_Year", &scope.financial_year.to_string())
+            .append_pair("Params_Journal", scope.journal_code.trim())
+            .append_pair("Params_Number_From", &scope.entry_number.to_string())
+            .append_pair("Params_Number_To", &scope.entry_number.to_string())
+            .append_pair("Params_Period_From", &scope.financial_period.to_string())
+            .append_pair("Params_Period_To", &scope.financial_period.to_string())
+            .append_pair("Params_Status", "20,50")
+            .append_pair(
+                "Params_EntryDate_From",
+                &scope.posting_date.format("%d-%m-%Y").to_string(),
+            )
+            .append_pair(
+                "Params_EntryDate_To",
+                &scope.posting_date.format("%d-%m-%Y").to_string(),
+            );
+        let mut response = self
+            .get_response(
+                url,
+                "application/xml",
+                "Exact scoped bank XML export failed",
+            )
+            .await?;
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|size| size <= limit as u64),
+            "Bank XML export exceeds size limit"
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("Cannot read scoped bank XML export")?
+        {
+            ensure!(
+                body.len().saturating_add(chunk.len()) <= limit,
+                "Bank XML export exceeds size limit"
             );
             body.extend_from_slice(&chunk);
         }

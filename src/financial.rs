@@ -544,6 +544,13 @@ impl Backend {
         crate::ledger::get_report(&self.client, &self.administration, args).await
     }
 
+    pub async fn preview_bank_gl_xml(
+        &self,
+        args: crate::bank::PreviewBankGlXml,
+    ) -> Result<crate::bank::BankXmlPreview> {
+        crate::bank::preview(&self.client, &self.administration, args).await
+    }
+
     pub async fn propose_bank_transaction_handling(
         &self,
         args: crate::bank::ProposeBankTransactionHandling,
@@ -935,6 +942,12 @@ impl Money {
         );
         self.0 = sum;
         Ok(())
+    }
+}
+
+impl std::fmt::Display for Money {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
     }
 }
 

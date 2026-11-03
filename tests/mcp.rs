@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 33);
+    assert_eq!(tools.len(), 34);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -217,6 +217,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "preview_bank_gl_xml"
                     | "propose_bank_transaction_handling"
                     | "preflight_purchase_booking"
                     | "assess_purchase_duplicates"
@@ -271,6 +272,32 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             !schema["required"]
                 .as_array()
                 .is_some_and(|required| required.contains(&json!("query")))
+        );
+    }
+    let xml_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "preview_bank_gl_xml")
+        .unwrap()["inputSchema"];
+    assert_eq!(xml_schema["additionalProperties"], false);
+    assert_eq!(
+        xml_schema["properties"]["expected_pending_amount"]["type"],
+        "string"
+    );
+    assert!(xml_schema["properties"].get("execute").is_none());
+    assert!(xml_schema["properties"].get("approval_token").is_none());
+    for field in [
+        "bank_transaction_line_id",
+        "pending_posting_line_id",
+        "destination_gl_account_id",
+        "no_vat_code",
+        "expected_pending_amount",
+        "expected_currency",
+    ] {
+        assert!(
+            xml_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
         );
     }
     let bank_schema = &tools
@@ -2218,6 +2245,104 @@ fn stdio_bank_handling_proposal_checks_explicit_invoice_selection_without_financ
             .unwrap(),
         *data
     );
+    api.join().unwrap();
+    process.shutdown();
+    assert!(!directory.join("downloads").exists());
+}
+
+#[test]
+fn stdio_xml_bank_preview_returns_a_blocked_specimen_and_exposes_no_upload_action() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let id = |n| uuid::Uuid::from_u128(n).to_string();
+    let api = thread::spawn(move || {
+        let post = |value: u128, gl: u128, code: &str, offset: Option<u128>, amount: &str| json!({"ID":id(value),"EntryID":id(1001),"Division":42,"Account":null,"EntryNumber":1001,"FinancialYear":2025,"FinancialPeriod":1,"JournalCode":"B1","GLAccount":id(gl),"GLAccountCode":code,"LineNumber":2,"Type":40,"Status":20,"Date":"2025-01-01","AmountDC":serde_json::from_str::<Value>(amount).unwrap(),"AmountFC":serde_json::from_str::<Value>(amount).unwrap(),"Currency":"EUR","OffsetID":offset.map(id)});
+        let control = post(101, 11, "BANK", None, "-11.3");
+        let pending = post(201, 10, "U1", Some(101), "11.3");
+        let header = json!({"d":[{"EntryID":id(1001),"Division":42,"EntryNumber":1001,"JournalCode":"B1","FinancialYear":2025,"FinancialPeriod":1,"Currency":"EUR","OpeningBalanceFC":100,"ClosingBalanceFC":88.7,"Status":20}]});
+        let native = json!({"d":[{"ID":id(201),"EntryID":id(1001),"Division":42,"EntryNumber":1001,"LineNumber":2,"Date":"2025-01-01","GLAccount":id(10),"GLAccountCode":"U1","OffsetID":id(101),"AmountDC":-11.3,"AmountFC":-11.3,"Description":"Travel & review","Document":id(700)}]});
+        let mut responses=vec![
+            ("/system/Divisions?",json!({"d":[{"Code":42,"Currency":"EUR"}]})),
+            ("/financial/Journals?",json!({"d":[{"ID":id(1),"Division":42,"Code":"B1","Type":12,"GLAccount":id(11)}]})),
+            ("/financial/GLAccounts?",json!({"d":[{"ID":id(10),"Division":42,"Code":"U1","Type":90}]})),
+            ("/financialtransaction/TransactionLines?",json!({"d":[pending]})),
+            ("/read/financial/PayablesList?",json!({"d":[]})),("/read/financial/ReceivablesList?",json!({"d":[]})),
+            ("/financialtransaction/TransactionLines?",json!({"d":[control]})),("/financialtransaction/TransactionLines?",json!({"d":[control,pending]})),
+            ("/financialtransaction/BankEntries?",header.clone()),("/financialtransaction/BankEntryLines?",native.clone()),
+            ("/financial/GLAccounts?",json!({"d":[{"ID":id(10),"Division":42,"Code":"U1","Type":90},{"ID":id(11),"Division":42,"Code":"BANK","Type":12},{"ID":id(200),"Division":42,"Code":"COST","Type":120,"IsBlocked":false,"UseCostcenter":0,"UseCostunit":0}]})),
+            ("/vat/VATCodes?",json!({"d":[{"ID":id(500),"Division":42,"Code":"N0","Type":"N","IsBlocked":false,"VATTransactionType":"P"}]})),("/vat/VatPercentages?",json!({"d":[]})),
+            ("/financial/Journals?",json!({"d":[{"ID":id(1),"Division":42,"Code":"B1","Type":12,"IsBlocked":false}]})),
+            ("/financial/FinancialPeriods?",json!({"d":[{"ID":id(600),"Division":42,"FinYear":2025,"FinPeriod":1,"StartDate":"2025-01-01","EndDate":"2025-01-31"}]})),
+            ("/read/financial/JournalStatusList?",json!({"d":[{"Journal":"B1","Year":2025,"Period":1,"Status":0}]})),
+        ].into_iter().map(|(path,body)|(path,body.to_string())).collect::<Vec<_>>();
+        let line = |offset: &str, code: &str, amount: &str| {
+            format!(
+                "<GLTransactionLine type=\"40\" linetype=\"0\" line=\"2\"{offset} status=\"20\"><Date>2025-01-01</Date><FinYear number=\"2025\"/><FinPeriod number=\"1\"/><GLAccount code=\"{code}\"/>{}<Amount><Currency code=\"EUR\"/><Value>{amount}</Value></Amount><Note><![CDATA[untrusted <text>]]></Note></GLTransactionLine>",
+                if offset.is_empty() {
+                    ""
+                } else {
+                    "<GLOffset code=\"BANK\"/>"
+                }
+            )
+        };
+        let xml = format!(
+            "<eExact><GLTransactions><GLTransaction entry=\"1001\"><TransactionType number=\"40\"/><Journal code=\"B1\"/><Date>2025-01-01</Date><OpeningBalance>100</OpeningBalance><ClosingBalance>88.7</ClosingBalance>{}{}</GLTransaction></GLTransactions><Topics><Topic code=\"GLTransactions\" ts_d=\"0x0000000000000001\" count=\"1\" pagesize=\"100\"/></Topics><Messages/></eExact>",
+            line(" offsetline=\"1\"", "U1", "11.3"),
+            line("", "BANK", "-11.3")
+        );
+        responses.push(("/docs/XMLDownload.aspx?", xml));
+        responses.push(("/financialtransaction/BankEntries?", header.to_string()));
+        responses.push(("/financialtransaction/BankEntryLines?", native.to_string()));
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(
+                target.starts_with("GET ") && target.contains(path),
+                "{target}"
+            );
+            assert!(!target.contains("XMLUpload"));
+            assert!(!target.contains("Params_DownloadID"));
+            let content = if path.starts_with("/docs/") {
+                assert!(target.contains("Params_Year=2025"));
+                assert!(target.contains("_Division_=42"));
+                "application/xml"
+            } else {
+                "application/json"
+            };
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: {content}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let args = json!({"bank_transaction_line_id":id(101),"pending_posting_line_id":id(201),"destination_gl_account_id":id(200),"no_vat_code":"N0","expected_pending_amount":"11.30","expected_currency":"EUR","unassigned_gl_account_ids":[id(10)]});
+    let response = process.request(
+        2,
+        "tools/call",
+        json!({"name":"preview_bank_gl_xml","arguments":args}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let data = &response["result"]["structuredContent"];
+    assert_eq!(data["status"], "blocked");
+    assert_eq!(data["authorizes_upload"], false);
+    assert_eq!(data["upload_attempted"], false);
+    assert_eq!(data["schema_validated"], false);
+    assert!(data["approval_token"].is_null());
+    assert_eq!(data["candidate_xml_line_count"], 1);
+    assert_eq!(data["source_bank_line_count"], 1);
+    assert_eq!(data["source_document_mapping_included"], false);
+    assert!(
+        data["experimental_xml"]
+            .as_str()
+            .unwrap()
+            .contains("<Value>-11.3</Value>")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(response["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap(),
+        *data
+    );
+    assert!(!response.to_string().contains("fixture-access-token"));
     api.join().unwrap();
     process.shutdown();
     assert!(!directory.join("downloads").exists());

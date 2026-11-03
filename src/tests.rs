@@ -5089,3 +5089,6 @@ mod purchase_preflight_tests;
 
 #[path = "bank/proposal_tests.rs"]
 mod bank_proposal_tests;
+
+#[path = "bank/xml_preview_tests.rs"]
+mod bank_xml_preview_tests;
