@@ -401,6 +401,13 @@ impl Backend {
         crate::draft::get_details(&self.client, &self.administration, args).await
     }
 
+    pub async fn assess_purchase_duplicates(
+        &self,
+        args: crate::purchase_documents::AssessPurchaseDuplicates,
+    ) -> Result<crate::purchase_documents::PurchaseDuplicateAssessment> {
+        crate::purchase_documents::assess_duplicates(&self.client, &self.administration, args).await
+    }
+
     pub async fn search_purchase_documents(
         &self,
         args: crate::purchase_documents::SearchPurchaseDocuments,
@@ -868,6 +875,10 @@ impl Money {
         Decimal::from_str_exact(value)
             .map(Self)
             .map_err(|_| anyhow::anyhow!("Invalid or out-of-range XML financial amount"))
+    }
+
+    pub(crate) fn same_magnitude(self, other: Self) -> bool {
+        self.0.abs() == other.0.abs()
     }
 
     pub(crate) fn add(&mut self, other: Self) -> Result<()> {

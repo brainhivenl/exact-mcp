@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 30);
+    assert_eq!(tools.len(), 31);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -217,6 +217,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "assess_purchase_duplicates"
                     | "search_purchase_documents"
                     | "get_purchase_document"
                     | "download_purchase_document_pdf"
@@ -268,6 +269,35 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             !schema["required"]
                 .as_array()
                 .is_some_and(|required| required.contains(&json!("query")))
+        );
+    }
+    let duplicate_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "assess_purchase_duplicates")
+        .unwrap()["inputSchema"];
+    assert_eq!(duplicate_schema["additionalProperties"], false);
+    for required in ["account_id", "supplier_invoice_reference"] {
+        assert!(
+            duplicate_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required))
+        );
+    }
+    for optional in [
+        "invoice_date",
+        "currency",
+        "amount_transaction_currency",
+        "source_document_id",
+        "limit",
+        "offset",
+    ] {
+        assert!(duplicate_schema["properties"][optional].is_object());
+        assert!(
+            !duplicate_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(optional))
         );
     }
     let intake_schema = &tools
@@ -1809,4 +1839,94 @@ fn stdio_purchase_intake_discovers_documents_before_entries_and_downloads_only_s
     assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
     api.join().unwrap();
     process.shutdown();
+}
+
+#[test]
+fn stdio_purchase_duplicate_assessment_returns_evidence_not_booking_clearance() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let entry_id = "22222222-2222-2222-2222-222222222222";
+    let document_id = "33333333-3333-3333-3333-333333333333";
+    let api = thread::spawn(move || {
+        let account =
+            json!({"ID":ACCOUNT_ID,"Division":42,"Code":" 001 ","Name":"Invented supplier"});
+        let mut entry = json!({"EntryID":entry_id,"Division":42,"Supplier":ACCOUNT_ID,"EntryNumber":12345,"Journal":"P1","EntryDate":"2025-01-01","YourRef":" 000REF ","Currency":"EUR","Status":50,"Type":30,"Document":document_id});
+        entry["AmountFC"] = serde_json::from_str("-121.00").unwrap();
+        let document = json!({"ID":document_id,"Division":42,"Type":20,"Account":ACCOUNT_ID,"Subject":"Source document","AmountFC":121.00,"Currency":"EUR","FinancialTransactionEntryID":entry_id,"ProposedEntryStatus":50});
+        let responses = [
+            ("/crm/Accounts?", json!({"d":[account.clone()]})),
+            ("/purchaseentry/PurchaseEntries?", json!({"d":[entry]})),
+            ("/documents/Documents?", json!({"d":[document]})),
+            ("/crm/Accounts?", json!({"d":[account]})),
+            ("/purchaseentry/PurchaseEntries?", json!({"d":[]})),
+            ("/documents/Documents?", json!({"d":[]})),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with("GET /api/v1/42/"));
+            assert!(target.contains(path), "{target}");
+            assert!(!target.contains("YourRef") || target.contains("%24select="));
+            assert!(!target.contains("000REF"));
+            assert!(
+                !target.contains("SupplierItem")
+                    && !target.contains("/project/")
+                    && !target.contains("/purchase/PurchaseInvoices")
+            );
+            send_response(&mut stream, body);
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response=process.request(2,"tools/call",json!({"name":"assess_purchase_duplicates","arguments":{"account_id":ACCOUNT_ID,"supplier_invoice_reference":"000REF","invoice_date":"2025-01-01","currency":"EUR","amount_transaction_currency":"121.00"}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["assessment"], "candidates_found_review_required");
+    assert_eq!(result["can_rule_out_duplicates"], false);
+    assert_eq!(result["matched_candidate_count"], 2);
+    assert_eq!(result["coverage"]["all_selected_source_pages_read"], true);
+    let entry = result["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["source"] == "accounting_entry")
+        .unwrap();
+    assert_eq!(entry["entry"]["amount_transaction_currency"], "-121.00");
+    assert_eq!(
+        entry["evidence"]["amount_comparison"],
+        "same_magnitude_different_sign"
+    );
+    assert_eq!(
+        entry["evidence"]["reference_comparison"],
+        "exact_after_outer_trim"
+    );
+    let document = result["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["source"] == "purchase_document")
+        .unwrap();
+    assert_eq!(
+        document["evidence"]["linked_accounting_entry_ids"],
+        json!([entry_id])
+    );
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    assert!(!response.to_string().contains("fixture-access-token"));
+    let response=process.request(3,"tools/call",json!({"name":"assess_purchase_duplicates","arguments":{"account_id":ACCOUNT_ID,"supplier_invoice_reference":"000REF"}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["assessment"],
+        "inconclusive_no_candidates_in_checked_sources"
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["can_rule_out_duplicates"],
+        false
+    );
+    let response=process.request(4,"tools/call",json!({"name":"assess_purchase_duplicates","arguments":{"account_id":ACCOUNT_ID,"supplier_invoice_reference":"000REF","amount_transaction_currency":"121.00"}}));
+    assert_eq!(response["result"]["isError"], true);
+    api.join().unwrap();
+    process.shutdown();
+    assert!(!directory.join("downloads").exists());
 }

@@ -15,6 +15,10 @@ use crate::invoice::number_string;
 use crate::pdf::{self, Attachment};
 use crate::store::Administration;
 
+mod duplicates;
+
+pub use duplicates::{AssessPurchaseDuplicates, PurchaseDuplicateAssessment, assess_duplicates};
+
 const DOCUMENT_FIELDS: &str = "ID,Division,HID,Type,TypeDescription,Subject,Account,AccountCode,AccountName,DocumentDate,Created,Modified,ProposedEntryStatus,EntryStatusDescription,FinancialTransactionEntryID,AmountFC,Currency";
 const COVERAGE: &str =
     "purchase_invoice_type_20_documents_only_not_complete_inbox_or_duplicate_check";

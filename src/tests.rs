@@ -5080,3 +5080,6 @@ mod item_context_tests;
 
 #[path = "purchase_documents/tests.rs"]
 mod purchase_document_tests;
+
+#[path = "purchase_documents/duplicates_tests.rs"]
+mod purchase_duplicate_tests;

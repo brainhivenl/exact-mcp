@@ -12,10 +12,12 @@ exact-mcp is a local [Model Context Protocol (MCP)](https://modelcontextprotocol
 | Invoice investigation | “Find this supplier invoice, show its accounting lines and download the existing PDF.” |
 | Recorded matching | “What allocations are recorded against this invoice, and which cashflow postings are linked?” |
 | Bank transactions needing attention | “Show the reconstructed bank queue, its booking lines and any unresolved links.” |
-| Purchase-document review | “Find incoming purchase documents and inspect their attachments and explicit accounting links.” |
+| Purchase-document review | “Find incoming purchase documents, inspect accounting links and assess duplicate candidates.” |
 | Booking preparation and reporting | “Check this supplier’s defaults, VAT codes and journal-period locks” or “Show movement on this G/L account.” |
 
-You can also inspect unprocessed commercial sales invoices and look up items, units and supplier-item context where your Exact subscription supports them. Booking preparation provides reference data for human review, not an automated preflight or approval to book.
+See [purchase duplicate assessment and booking preparation](docs/booking.md) for source coverage and interpretation limits.
+
+You can also inspect unprocessed commercial sales invoices and look up items, units and supplier-item context where your Exact subscription supports them. Booking preparation and duplicate evidence support human review, not approval to book.
 
 ## Boundaries that matter
 
