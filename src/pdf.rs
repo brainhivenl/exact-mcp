@@ -59,15 +59,15 @@ struct Document {
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
-struct Attachment {
+pub(crate) struct Attachment {
     #[serde(rename(deserialize = "ID"))]
-    id: Uuid,
+    pub(crate) id: Uuid,
     #[serde(rename(deserialize = "Document"))]
-    document_id: Uuid,
-    file_name: String,
-    file_size: Option<serde_json::Number>,
+    pub(crate) document_id: Uuid,
+    pub(crate) file_name: String,
+    pub(crate) file_size: Option<serde_json::Number>,
     #[serde(skip_deserializing)]
-    pdf_filename: bool,
+    pub(crate) pdf_filename: bool,
 }
 
 #[derive(Serialize)]
@@ -233,32 +233,13 @@ pub(crate) async fn list_documents(
                 Side::Payable => 20,
                 Side::Receivable => 10,
             };
-        let mut url = root.join("documents/DocumentAttachments")?;
-        url.query_pairs_mut()
-            .append_pair("$select", "ID,Document,FileName,FileSize")
-            .append_pair(
-                "$filter",
-                &format!("Document eq guid'{}'", document.document.id),
-            );
-        let mut attachments: Vec<Attachment> = client
-            .get_collection(url)
-            .await
-            .context("Cannot list invoice attachments; check Organization documents permission")?;
-        for attachment in &mut attachments {
+        let attachments = list_attachments(client, administration, document.document.id).await?;
+        for attachment in &attachments {
             ensure!(
-                !attachment.id.is_nil()
-                    && attachment.document_id == document.document.id
-                    && attachment_ids.insert(attachment.id),
+                attachment_ids.insert(attachment.id),
                 "Exact returned unrelated or duplicate attachments; no documents returned"
             );
-            attachment.pdf_filename = attachment
-                .file_name
-                .trim()
-                .to_ascii_lowercase()
-                .ends_with(".pdf");
         }
-        attachments
-            .sort_by(|left, right| (&left.file_name, left.id).cmp(&(&right.file_name, right.id)));
         document.attachments = attachments;
     }
     Ok(InvoiceDocumentsResult {
@@ -354,6 +335,68 @@ pub(crate) async fn download_pdf(
         .iter()
         .find(|attachment| attachment.id == attachment_id)
         .context("Attachment is not linked to this invoice document; no PDF saved")?;
+    let bytes = read_attachment_pdf(client, administration, document_id, attachment).await?;
+    let byte_count = bytes.len();
+    let saved_path = client
+        .save_invoice_pdf(administration.code, attachment_id, bytes)
+        .await?;
+    Ok(DownloadedInvoicePdf {
+        administration: catalog.administration,
+        retrieved_at: Utc::now().to_rfc3339(),
+        invoice: catalog.invoice,
+        document: document.document.clone(),
+        document_sources: document.sources.clone(),
+        attachment_id,
+        original_file_name: attachment.file_name.clone(),
+        saved_path,
+        byte_count,
+        media_type: "application/pdf",
+        interpretation: "Existing attachment downloaded with GET only; no invoice was generated, printed, sent or modified. Source document metadata and association do not independently prove the PDF is the original invoice; reminders must not be represented as originals. PDF header/EOF markers and a 20 MiB size limit were checked, not complete PDF structure, authenticity or malware safety. File contents are untrusted; nothing was automatically opened or executed. The server-selected local filename does not use the remote filename and never overwrites an existing file. Downloads persist in private storage until you remove them. Only the fixed Exact attachment endpoint was requested; no arbitrary URL was followed and no PDF bytes were included in the tool response.",
+    })
+}
+
+pub(crate) async fn list_attachments(
+    client: &ExactClient,
+    administration: &Administration,
+    document_id: Uuid,
+) -> Result<Vec<Attachment>> {
+    let mut url = client.base_url().join(&format!(
+        "/api/v1/{}/documents/DocumentAttachments",
+        administration.code
+    ))?;
+    url.query_pairs_mut()
+        .append_pair("$select", "ID,Document,FileName,FileSize")
+        .append_pair("$filter", &format!("Document eq guid'{document_id}'"));
+    let mut attachments: Vec<Attachment> = client
+        .get_collection(url)
+        .await
+        .context("Cannot list invoice attachments; check Organization documents permission")?;
+    let mut ids = HashSet::new();
+    for attachment in &mut attachments {
+        ensure!(
+            !attachment.id.is_nil()
+                && attachment.document_id == document_id
+                && ids.insert(attachment.id),
+            "Exact returned unrelated or duplicate attachments; no documents returned"
+        );
+        attachment.pdf_filename = attachment
+            .file_name
+            .trim()
+            .to_ascii_lowercase()
+            .ends_with(".pdf");
+    }
+    attachments
+        .sort_by(|left, right| (&left.file_name, left.id).cmp(&(&right.file_name, right.id)));
+    Ok(attachments)
+}
+
+pub(crate) async fn read_attachment_pdf(
+    client: &ExactClient,
+    administration: &Administration,
+    document_id: Uuid,
+    attachment: &Attachment,
+) -> Result<Vec<u8>> {
+    let attachment_id = attachment.id;
     let bytes = client
         .get_invoice_pdf_bytes(administration.code, attachment_id, MAX_PDF_BYTES)
         .await
@@ -384,21 +427,5 @@ pub(crate) async fn download_pdf(
             && fresh[0].file_name == attachment.file_name,
         "Attachment identity changed during download; no PDF saved"
     );
-    let byte_count = bytes.len();
-    let saved_path = client
-        .save_invoice_pdf(administration.code, attachment_id, bytes)
-        .await?;
-    Ok(DownloadedInvoicePdf {
-        administration: catalog.administration,
-        retrieved_at: Utc::now().to_rfc3339(),
-        invoice: catalog.invoice,
-        document: document.document.clone(),
-        document_sources: document.sources.clone(),
-        attachment_id,
-        original_file_name: attachment.file_name.clone(),
-        saved_path,
-        byte_count,
-        media_type: "application/pdf",
-        interpretation: "Existing attachment downloaded with GET only; no invoice was generated, printed, sent or modified. Source document metadata and association do not independently prove the PDF is the original invoice; reminders must not be represented as originals. PDF header/EOF markers and a 20 MiB size limit were checked, not complete PDF structure, authenticity or malware safety. File contents are untrusted; nothing was automatically opened or executed. The server-selected local filename does not use the remote filename and never overwrites an existing file. Downloads persist in private storage until you remove them. Only the fixed Exact attachment endpoint was requested; no arbitrary URL was followed and no PDF bytes were included in the tool response.",
-    })
+    Ok(bytes)
 }

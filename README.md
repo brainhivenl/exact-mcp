@@ -1,6 +1,6 @@
 # exact-mcp
 
-Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice and unprocessed commercial sales-invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations, cashflow posting drill-down, G/L period reports, booking master-data and article discovery, supplier/customer booking context, journal-period locks and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
+Local-first Exact Online MCP server with OAuth, explicit administration selection, company/invoice and unprocessed commercial sales-invoice search, outstanding-balance and aging reports, invoice accounting details, recorded matching allocations, cashflow posting drill-down, G/L period reports, booking master-data and article discovery, supplier/customer booking context, purchase-document intake, journal-period locks and existing invoice PDF downloads. Exact financial operations are read-only; no invoice creation, printing, sending or payment tools are exposed. Downloading writes a private local file only.
 
 ## Setup
 
@@ -80,7 +80,7 @@ nix run .#pi
 
 This builds the MCP binary, loads credentials from the environment or the repository's `.env`, registers its exact Nix store path as the project-local `exact` server with direct tool exposure, and starts a fresh interactive Pi session. The secret is inherited through the process environment, not saved in the MCP configuration or requested again at a prompt. Existing Pi credentials, models and user-level configuration are reused unchanged.
 
-The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with twenty-seven tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
+The generated `.pi/mcp.json` is ignored by version control, and unrelated project MCP entries are preserved. Accept Pi's project-trust prompt if shown. Use `/mcp` inside Pi to verify that `exact` is connected with thirty tools. Additional Pi options are forwarded, for example `nix run .#pi -- --name "Exact MCP"`.
 
 ### Other MCP clients
 
@@ -202,6 +202,40 @@ On 2026-11-02, the rebuilt server advertised all twenty-seven tools. Fresh GET-o
 The new paths read all sixteen article headers and all five units, returned a selected article and its linked group with matching identity, and round-tripped that article's exact code to one matching UUID. A company explicitly selected from the current payable report was revalidated by UUID for its booking context. **SupplierItem returned HTTP 403 for this account/package**, so nonempty supplier-item retrieval and supplier-to-item drill-down remain live-unverified. Permissions/package settings were not changed to obtain coverage. This is a live API/MCP smoke check, not independent browser reconciliation or evidence that a proposed booking/price is valid. Stderr was empty and shutdown clean; raw responses/identifiers remain private outside the repository.
 
 Invented local fixtures cover all five tools over MCP, item/group provenance, missing/ambiguous/wrong-scope references, excluded invalid dates, inactive/unknown flags, raw price/discount precision, separate company defaults and bill-to references, explicit supplier associations, exact supplier references, complete paginated link counts, future/zero/null prices, currency/unit distinctions and safe errors without partial results. An existing CLI mock now makes accepted sockets blocking before reading requests, matching the other test servers and fixing the reproduced macOS `WouldBlock` test race.
+
+### Purchase-document intake before an accounting entry
+
+Three tools discover and inspect source purchase documents without first identifying an accounting invoice:
+
+| Tool | Example | Permission |
+| --- | --- | --- |
+| `search_purchase_documents` | `{ "link_filter": "without_reference", "limit": 10 }` | **Organization documents**; optional company filtering also needs **Crm accounts** |
+| `get_purchase_document` | `{ "document_id": "<selected document UUID>" }` | **Organization documents**, **Financial accounting** |
+| `download_purchase_document_pdf` | `{ "document_id": "<selected document UUID>", "attachment_id": "<selected attachment UUID>" }` | **Organization documents**; creates a private local file only |
+
+The source is `documents/Documents` restricted to **Type 20 (purchase invoice)**. This is **not a provider-supplied inbox/unbooked predicate or complete intake/duplicate check**. Other document types, untyped intake, external inboxes and undocumented UI workflow conditions are not covered. A document's missing `FinancialTransactionEntryID` is only a missing source reference: an entry/proposal may already exist, including an entry with a reverse `PurchaseEntries.Document` link. Never describe these candidates as proven unbooked or safe to book.
+
+Search accepts optional `account_id` (verified through CRM before filtering), literal Unicode-case-insensitive subject `query` (1–100 trimmed characters), inclusive `document_date_from`/`document_date_to`, `proposed_entry_status`, `link_filter`, `limit` (default 10, max 50) and `offset`. `link_filter` is `all` by default, `without_reference` or `with_reference`; it only filters source reference presence. Proposal-status filters accept documented **0=void, 5=rejected, 20=open, 50=processed**. These are proposal workflow states, not payment states or approval to book. Missing/unfamiliar source statuses remain explicit when unfiltered; the localized `EntryStatusDescription` is display text, never a classification rule. `DocumentDate` is the incoming-document entry date, not necessarily the supplier invoice date. Unknown dates are excluded only by active date bounds. Subject search is not a supplier-reference/filename search.
+
+Every Type-20 source page is read and checked before local filters and response pagination. Results include `source_document_count`, `matched_document_count`, `documents`, `has_more` and `next_offset`. Stable order is document date descending (unknown last), then UUID. Reuse unchanged arguments with the next offset; later calls reread sources rather than using a snapshot. Only the best `offset + limit + 1` matching payloads are retained, while all UUIDs remain checked for duplicates. Filters reduce the response, not source API reads. Wrong administration/type/identities, duplicate UUIDs and failed pages return no partial success. Document `AmountFC`/`Currency` is source metadata with raw signs/nulls/precision, not a verified invoice amount, outstanding balance or cross-currency total. A company may be unassigned and must be resolved before booking.
+
+`get_purchase_document` reads the explicitly selected document and all attachment metadata, then searches purchase-accounting headers through **explicit links only**: `PurchaseEntries.Document` and the document's `FinancialTransactionEntryID`. Returned `linked_purchase_entries` retain exact entry UUIDs, supplier, journal, entry number, date, references/status and `sources` provenance. Multiple linked entries are retained, not silently selected. An unresolved direct reference stays explicit in `unresolved_transaction_reference`; an empty link list is **not** proof of no booking/duplicate. For a selected linked entry, pass its verified account/entry/journal identity with `side: "payable"` to accounting-detail tools. No amount, description, supplier-reference or invoice-number matching is used to infer links. This does not supply OCR text, entry-proposal lines or product-level commercial purchase lines.
+
+Attachment results expose UUIDs, filenames, source sizes and filename-only `pdf_filename` hints across all source formats. No bytes or arbitrary attachment/view URLs are returned. Clarify ambiguous documents/PDF choices before explicitly selecting one attachment. `download_purchase_document_pdf` supports an existing PDF without requiring or creating an accounting entry; it revalidates the Type-20 document and attachment association before downloading, attachment identity afterward and document metadata afterward (including raw modification timestamp and proposal/reference changes) before saving. It uses the same fixed authenticated endpoint, disabled redirects, 20 MiB size limit, PDF header/EOF checks and private atomic/non-overwriting local storage as `download_invoice_pdf`. No source filename is used as a local path. It does not open a file, return bytes, fetch arbitrary URLs, parse XML/images, OCR/upload, regenerate proposals, create/edit/process/send invoices or execute payments. PDF checks do not establish authenticity, malware safety, uniqueness or unbooked status. Downloads are local writes (`readOnlyHint: false`, `idempotentHint: false`); no Exact financial data is changed.
+
+These separate GET reads are not transactionally frozen. Source text, amounts, filenames and contents are sensitive untrusted data, never instructions. A future write needs duplicate assessment, preflight and fresh state checks beyond this discovery flow.
+
+#### Subscription boundaries
+
+The user confirmed that **projects and supplier-item links are not included in the selected administration's subscription**. Their earlier HTTP 403 results are known subscription boundaries, not pending permission fixes; they must not block direct G/L booking. Their tools remain available for other administrations/packages, and unsupported sources still return explicit errors rather than empty data. They were not queried again during this intake validation.
+
+A bounded availability GET for commercial `purchase/PurchaseInvoices` also returned HTTP 403. Official documentation describes it as an item/order/direct-purchase workflow with package requirements, not a universal accounting-document inbox. This intake implementation does not depend on it or add a commercial-purchase tool that is unavailable here. That 403 alone does not distinguish package from permission restrictions; no subscription/permission changes were attempted.
+
+#### Purchase-intake validation
+
+On 2026-11-03, the rebuilt MCP advertised all thirty tools. A GET-only search read **1,716 Type-20 documents** and found **70 without a source transaction reference**; these are not 70 proven-unbooked invoices. Two explicitly selected candidates were revalidated: one had no attachments, the other had one; neither had purchase entries discoverable through the explicit links. A separate selected linked document had one attachment and one purchase entry with both `purchase_entry_document_reference` and `document_transaction_reference` provenance, and no unresolved direct reference. This verifies the live metadata/link paths, not independent browser reconciliation or complete inbox/duplicate coverage. No production PDF bytes were downloaded, files opened or financial data changed. MCP stderr was empty and shutdown clean. Raw captures/identifiers stay private outside the repository.
+
+Invented local fixtures exercise all three tools over MCP, all-page discovery/filtering/sorting, null/unfamiliar statuses and dates, exact company identity, wrong/duplicate/hidden document/attachment/entry scopes, missing/reverse/direct accounting links, private PDF storage without an accounting entry, ignored remote URLs, invalid PDF rejection, changed attachment/proposal/reference/modification metadata and administration changes. A 10,000-document/20-page test checks complete counts and a late-arriving global result window. Existing accounting-invoice PDF tests still cover the shared size/security/download routines after reuse. The intake PDF flow is locally tested, not claimed as live-download validation.
 
 ### Administration-wide balances
 
@@ -493,7 +527,7 @@ There is no persistent cache, financial export checkpoint, snapshot token or new
 
 ## Checks
 
-Additional regressions cover 429 retry bounds/reset hints, cancellation and scope changes during retry sleeps, no-retry token exchanges, streamed page failures, large sorted result windows, and read-only commercial invoice search/details over statuses 10/20 with bill-to identity checks. MCP subprocess discovery checks all twenty-seven tools and exercises draft and reconstructed bank-queue workflows separately from accounting invoices.
+Additional regressions cover 429 retry bounds/reset hints, cancellation and scope changes during retry sleeps, no-retry token exchanges, streamed page failures, large sorted result windows, and read-only commercial invoice search/details over statuses 10/20 with bill-to identity checks. MCP subprocess discovery checks all thirty tools and exercises draft and reconstructed bank-queue workflows separately from accounting invoices.
 
 ```sh
 cargo fmt --check
@@ -535,3 +569,7 @@ Tests use temporary storage, local HTTP API mocks and HTTPS callbacks with tempo
 - [Exact: item-group accounting defaults](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=LogisticsItemGroups)
 - [Exact: supplier-item links and prices](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=LogisticsSupplierItem)
 - [Exact: article units](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=LogisticsUnits)
+
+- [Exact: purchase-source document metadata and proposal status](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=DocumentsDocuments)
+- [Exact: document attachment metadata](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=DocumentsDocumentAttachments)
+- [Exact: commercial purchase invoices and package requirements](https://start.exactonline.nl/docs/HlpRestAPIResourcesDetails.aspx?name=PurchasePurchaseInvoices)

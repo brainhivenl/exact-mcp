@@ -401,6 +401,27 @@ impl Backend {
         crate::draft::get_details(&self.client, &self.administration, args).await
     }
 
+    pub async fn search_purchase_documents(
+        &self,
+        args: crate::purchase_documents::SearchPurchaseDocuments,
+    ) -> Result<crate::purchase_documents::PurchaseDocumentSearchResult> {
+        crate::purchase_documents::search(&self.client, &self.administration, args).await
+    }
+
+    pub async fn get_purchase_document(
+        &self,
+        args: crate::purchase_documents::GetPurchaseDocument,
+    ) -> Result<crate::purchase_documents::PurchaseDocumentDetails> {
+        crate::purchase_documents::get_document(&self.client, &self.administration, args).await
+    }
+
+    pub async fn download_purchase_document_pdf(
+        &self,
+        args: crate::purchase_documents::DownloadPurchaseDocumentPdf,
+    ) -> Result<crate::purchase_documents::DownloadedPurchaseDocumentPdf> {
+        crate::purchase_documents::download_pdf(&self.client, &self.administration, args).await
+    }
+
     pub async fn search_items(
         &self,
         args: crate::master_data::SearchMasterData,

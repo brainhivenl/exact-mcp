@@ -200,20 +200,26 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 30);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
             tool["name"] != "download_invoice_pdf"
+                && tool["name"] != "download_purchase_document_pdf"
         );
         assert_eq!(tool["annotations"]["destructiveHint"], false);
-        if tool["name"] == "download_invoice_pdf" {
+        if tool["name"] == "download_invoice_pdf"
+            || tool["name"] == "download_purchase_document_pdf"
+        {
             assert_eq!(tool["annotations"]["idempotentHint"], false);
         }
         assert!(matches!(
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "search_purchase_documents"
+                    | "get_purchase_document"
+                    | "download_purchase_document_pdf"
                     | "search_items"
                     | "get_item_details"
                     | "search_units"
@@ -263,6 +269,48 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                 .as_array()
                 .is_some_and(|required| required.contains(&json!("query")))
         );
+    }
+    let intake_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "search_purchase_documents")
+        .unwrap()["inputSchema"];
+    assert_eq!(intake_schema["additionalProperties"], false);
+    for property in [
+        "account_id",
+        "query",
+        "link_filter",
+        "proposed_entry_status",
+        "document_date_from",
+        "document_date_to",
+        "limit",
+        "offset",
+    ] {
+        assert!(intake_schema["properties"][property].is_object());
+    }
+    assert!(
+        !intake_schema["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("account_id")))
+    );
+    for name in ["get_purchase_document", "download_purchase_document_pdf"] {
+        let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("document_id"))
+        );
+        assert!(schema["properties"].get("invoice").is_none());
+        assert!(schema["properties"].get("url").is_none());
+        if name == "download_purchase_document_pdf" {
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("attachment_id"))
+            );
+        }
     }
     for (name, required) in [
         ("get_item_details", "item_id"),
@@ -1654,4 +1702,111 @@ fn stdio_article_and_account_context_preserve_source_defaults_without_booking() 
     api.join().unwrap();
     process.shutdown();
     assert!(!directory.join("downloads").exists());
+}
+
+#[test]
+fn stdio_purchase_intake_discovers_documents_before_entries_and_downloads_only_selected_pdf() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let document_id = "22222222-2222-2222-2222-222222222222";
+    let attachment_id = "33333333-3333-3333-3333-333333333333";
+    let pdf = "%PDF-1.7\nInvented purchase intake PDF\n%%EOF\n";
+    let api = thread::spawn(move || {
+        let document = json!({"ID":document_id,"Division":42,"Type":20,"Subject":"Invented incoming purchase","Account":null,"DocumentDate":"2025-01-01","ProposedEntryStatus":20,"FinancialTransactionEntryID":null,"AmountFC":123.45,"Currency":"USD","Modified":"2025-01-01T10:01:02"});
+        let attachment = json!({"ID":attachment_id,"Document":document_id,"FileName":"incoming.pdf","FileSize":pdf.len(),"Url":"https://untrusted.invalid/never-follow"});
+        let responses = [
+            (
+                "/api/v1/42/documents/Documents?",
+                json!({"d":[document.clone()]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/Documents?",
+                json!({"d":[document.clone()]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/DocumentAttachments?",
+                json!({"d":[attachment.clone()]}).to_string(),
+            ),
+            (
+                "/api/v1/42/purchaseentry/PurchaseEntries?",
+                json!({"d":[]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/Documents?",
+                json!({"d":[document.clone()]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/DocumentAttachments?",
+                json!({"d":[attachment.clone()]}).to_string(),
+            ),
+            ("/docs/SysAttachment.aspx?", pdf.into()),
+            (
+                "/api/v1/42/documents/DocumentAttachments?",
+                json!({"d":[attachment]}).to_string(),
+            ),
+            (
+                "/api/v1/42/documents/Documents?",
+                json!({"d":[document]}).to_string(),
+            ),
+        ];
+        for (path, body) in responses {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(target.starts_with(&format!("GET {path}")), "{target}");
+            assert!(
+                !target.contains("ActionRegenerateEntryProposal") && !target.contains("MarkAsPaid")
+            );
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let response = process.request(
+        2,
+        "tools/call",
+        json!({"name":"search_purchase_documents","arguments":{"link_filter":"without_reference"}}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["matched_document_count"], 1);
+    assert_eq!(result["documents"][0]["id"], document_id);
+    assert_eq!(
+        result["documents"][0]["amount_transaction_currency"],
+        "123.45"
+    );
+    assert!(
+        result["coverage"]
+            .as_str()
+            .unwrap()
+            .contains("not_complete_inbox")
+    );
+    assert!(result.get("is_unbooked").is_none());
+    let response = process.request(
+        3,
+        "tools/call",
+        json!({"name":"get_purchase_document","arguments":{"document_id":document_id}}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["linked_purchase_entries"], json!([]));
+    assert_eq!(result["attachments"][0]["id"], attachment_id);
+    assert_eq!(result["attachments"][0]["pdf_filename"], true);
+    let response=process.request(4,"tools/call",json!({"name":"download_purchase_document_pdf","arguments":{"document_id":document_id,"attachment_id":attachment_id}}));
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    let path = PathBuf::from(result["saved_path"].as_str().unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), pdf.as_bytes());
+    assert!(path.starts_with(directory.canonicalize().unwrap().join("downloads/42")));
+    assert!(
+        !response
+            .to_string()
+            .contains("Invented purchase intake PDF")
+    );
+    assert!(!response.to_string().contains("untrusted.invalid"));
+    assert!(!response.to_string().contains("fixture-access-token"));
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    api.join().unwrap();
+    process.shutdown();
 }

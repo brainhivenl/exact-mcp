@@ -11,6 +11,7 @@ mod mcp;
 mod oauth;
 mod payment;
 mod pdf;
+mod purchase_documents;
 mod store;
 
 #[cfg(test)]

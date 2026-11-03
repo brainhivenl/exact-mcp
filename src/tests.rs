@@ -5077,3 +5077,6 @@ mod master_data_tests;
 
 #[path = "master_data/items_tests.rs"]
 mod item_context_tests;
+
+#[path = "purchase_documents/tests.rs"]
+mod purchase_document_tests;
