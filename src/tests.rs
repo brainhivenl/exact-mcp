@@ -5083,3 +5083,6 @@ mod purchase_document_tests;
 
 #[path = "purchase_documents/duplicates_tests.rs"]
 mod purchase_duplicate_tests;
+
+#[path = "master_data/preflight_tests.rs"]
+mod purchase_preflight_tests;

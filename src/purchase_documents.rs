@@ -312,6 +312,24 @@ pub struct PurchaseDocumentDetails {
     linkage_interpretation: &'static str,
 }
 
+impl PurchaseDocumentDetails {
+    pub(crate) fn supplier_id(&self) -> Option<Uuid> {
+        self.document.account_id
+    }
+
+    pub(crate) fn linked_entry_count(&self) -> usize {
+        self.linked_purchase_entries.len()
+    }
+
+    pub(crate) fn unresolved_reference(&self) -> bool {
+        self.unresolved_transaction_reference.is_some()
+    }
+
+    pub(crate) fn proposal_status(&self) -> Option<i16> {
+        self.document.proposed_entry_status
+    }
+}
+
 fn document_uuid(value: &str) -> Result<Uuid> {
     let id = Uuid::parse_str(value)
         .context("document_id must be a UUID from search_purchase_documents")?;

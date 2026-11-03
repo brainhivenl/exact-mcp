@@ -401,6 +401,14 @@ impl Backend {
         crate::draft::get_details(&self.client, &self.administration, args).await
     }
 
+    pub async fn preflight_purchase_booking(
+        &self,
+        args: crate::master_data::PreflightPurchaseBooking,
+    ) -> Result<crate::master_data::PurchaseBookingPreflight> {
+        crate::master_data::preflight_purchase_booking(&self.client, &self.administration, args)
+            .await
+    }
+
     pub async fn assess_purchase_duplicates(
         &self,
         args: crate::purchase_documents::AssessPurchaseDuplicates,
@@ -875,6 +883,22 @@ impl Money {
         Decimal::from_str_exact(value)
             .map(Self)
             .map_err(|_| anyhow::anyhow!("Invalid or out-of-range XML financial amount"))
+    }
+
+    pub(crate) fn exact_product(self, other: Self) -> Result<Self> {
+        let mut coefficient = self
+            .0
+            .mantissa()
+            .checked_mul(other.0.mantissa())
+            .context("Financial product exceeds exact coefficient precision")?;
+        let mut scale = self.0.scale() + other.0.scale();
+        while scale > 0 && coefficient % 10 == 0 {
+            coefficient /= 10;
+            scale -= 1;
+        }
+        Decimal::try_from_i128_with_scale(coefficient, scale)
+            .map(Self)
+            .map_err(|_| anyhow::anyhow!("Financial product exceeds exact decimal precision"))
     }
 
     pub(crate) fn same_magnitude(self, other: Self) -> bool {

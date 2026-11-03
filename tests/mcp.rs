@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 31);
+    assert_eq!(tools.len(), 32);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -217,6 +217,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "preflight_purchase_booking"
                     | "assess_purchase_duplicates"
                     | "search_purchase_documents"
                     | "get_purchase_document"
@@ -271,6 +272,47 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                 .is_some_and(|required| required.contains(&json!("query")))
         );
     }
+    let preflight_schema = &tools
+        .iter()
+        .find(|tool| tool["name"] == "preflight_purchase_booking")
+        .unwrap()["inputSchema"];
+    assert_eq!(preflight_schema["additionalProperties"], false);
+    for required in [
+        "account_id",
+        "supplier_invoice_reference",
+        "document_kind",
+        "invoice_date",
+        "financial_year",
+        "financial_period",
+        "journal_code",
+        "currency",
+        "gross_amount_transaction_currency",
+        "lines",
+    ] {
+        assert!(
+            preflight_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required))
+        );
+    }
+    assert_eq!(
+        preflight_schema["properties"]["gross_amount_transaction_currency"]["type"],
+        "string"
+    );
+    let line_reference = preflight_schema["properties"]["lines"]["items"]["$ref"]
+        .as_str()
+        .unwrap();
+    let line_schema = preflight_schema
+        .pointer(line_reference.strip_prefix('#').unwrap())
+        .unwrap();
+    assert_eq!(line_schema["additionalProperties"], false);
+    assert_eq!(
+        line_schema["properties"]["net_amount_transaction_currency"]["type"],
+        "string"
+    );
+    assert!(line_schema["properties"].get("project_id").is_none());
+    assert!(line_schema["properties"].get("item_id").is_none());
     let duplicate_schema = &tools
         .iter()
         .find(|tool| tool["name"] == "assess_purchase_duplicates")
@@ -1926,6 +1968,123 @@ fn stdio_purchase_duplicate_assessment_returns_evidence_not_booking_clearance() 
     );
     let response=process.request(4,"tools/call",json!({"name":"assess_purchase_duplicates","arguments":{"account_id":ACCOUNT_ID,"supplier_invoice_reference":"000REF","amount_transaction_currency":"121.00"}}));
     assert_eq!(response["result"]["isError"], true);
+    api.join().unwrap();
+    process.shutdown();
+    assert!(!directory.join("downloads").exists());
+}
+
+#[test]
+fn stdio_purchase_preflight_reports_evidence_unknowns_and_blockers_without_booking() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let gl = "22222222-2222-2222-2222-222222222222";
+    let vat = "33333333-3333-3333-3333-333333333333";
+    let rate = "44444444-4444-4444-4444-444444444444";
+    let api = thread::spawn(move || {
+        for _ in 0..2 {
+            let responses = [
+                (
+                    "/crm/Accounts?",
+                    json!({"d":[{"ID":ACCOUNT_ID,"Division":42,"Code":" 001 ","IsSupplier":true,"Blocked":false,"StartDate":"2000-01-01","EndDate":"2100-12-31"}]}),
+                ),
+                ("/purchaseentry/PurchaseEntries?", json!({"d":[]})),
+                ("/documents/Documents?", json!({"d":[]})),
+                (
+                    "/financial/Journals?",
+                    json!({"d":[{"ID":ACCOUNT_ID,"Division":42,"Code":"P1","Type":22,"IsBlocked":false,"Currency":"EUR","AllowVariableCurrency":false}]}),
+                ),
+                (
+                    "/financial/FinancialPeriods?",
+                    json!({"d":[{"ID":ACCOUNT_ID,"Division":42,"FinYear":2025,"FinPeriod":1,"StartDate":"2025-01-01","EndDate":"2025-01-31"}]}),
+                ),
+                (
+                    "/read/financial/JournalStatusList?",
+                    json!({"d":[{"Journal":"P1","Year":2025,"Period":1,"Status":0}]}),
+                ),
+                (
+                    "/system/Divisions?",
+                    json!({"d":[{"Code":42,"Currency":"EUR"}]}),
+                ),
+                (
+                    "/financial/GLAccounts?",
+                    json!({"d":[{"ID":gl,"Division":42,"Code":"4000","Type":120,"IsBlocked":false,"UseCostcenter":0,"UseCostunit":0}]}),
+                ),
+                (
+                    "/vat/VATCodes?",
+                    json!({"d":[{"ID":vat,"Division":42,"Code":"V1","Type":"E","IsBlocked":false,"VATTransactionType":"P","Charged":false,"CalculationBasis":0}]}),
+                ),
+                (
+                    "/vat/VatPercentages?",
+                    json!({"d":[{"ID":rate,"Division":42,"VATCodeID":vat,"StartDate":"2000-01-01","EndDate":"2100-12-31","Type":0,"Percentage":0.21}]}),
+                ),
+                (
+                    "/general/Currencies?",
+                    json!({"d":[{"Code":"EUR","Description":"Euro"}]}),
+                ),
+            ];
+            for (path, body) in responses {
+                let (mut stream, target) = accept_request(&listener);
+                assert!(
+                    target.starts_with("GET /api/v1/42/") && target.contains(path),
+                    "{target}"
+                );
+                for forbidden in [
+                    "/project/",
+                    "/logistics/",
+                    "/purchase/PurchaseInvoices",
+                    "SysAttachment",
+                ] {
+                    assert!(!target.contains(forbidden));
+                }
+                send_response(&mut stream, body);
+            }
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let mut args = json!({"account_id":ACCOUNT_ID,"supplier_invoice_reference":"NEW-0001","document_kind":"purchase_invoice","invoice_date":"2025-01-01","financial_year":2025,"financial_period":1,"journal_code":"P1","currency":"EUR","gross_amount_transaction_currency":"121.00","lines":[{"gl_account_id":gl,"net_amount_transaction_currency":"100.00","supplier_vat_amount_transaction_currency":"21.00","vat_code":"V1","vat_percentage":"0.21"}]});
+    let response = process.request(
+        2,
+        "tools/call",
+        json!({"name":"preflight_purchase_booking","arguments":args.clone()}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["status"], "review_required");
+    assert_eq!(result["authorizes_booking"], false);
+    assert_eq!(result["blockers"], json!([]));
+    assert!(!result["unknowns"].as_array().unwrap().is_empty());
+    assert_eq!(result["amount_reconciliation"]["exact_totals_match"], true);
+    assert_eq!(
+        result["line_evidence"][0]["declared_rate_unrounded_supplier_vat"],
+        "21"
+    );
+    assert_eq!(
+        result["duplicate_assessment"]["can_rule_out_duplicates"],
+        false
+    );
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *result);
+    assert!(!response.to_string().contains("fixture-access-token"));
+    assert!(result.get("write_payload").is_none());
+    args["gross_amount_transaction_currency"] = json!("120.99");
+    let response = process.request(
+        3,
+        "tools/call",
+        json!({"name":"preflight_purchase_booking","arguments":args}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert_eq!(response["result"]["structuredContent"]["status"], "blocked");
+    assert_eq!(
+        response["result"]["structuredContent"]["authorizes_booking"],
+        false
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["proposal"]["gross_amount_transaction_currency"],
+        "120.99"
+    );
     api.join().unwrap();
     process.shutdown();
     assert!(!directory.join("downloads").exists());

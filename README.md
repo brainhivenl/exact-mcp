@@ -13,7 +13,7 @@ exact-mcp is a local [Model Context Protocol (MCP)](https://modelcontextprotocol
 | Recorded matching | “What allocations are recorded against this invoice, and which cashflow postings are linked?” |
 | Bank transactions needing attention | “Show the reconstructed bank queue, its booking lines and any unresolved links.” |
 | Purchase-document review | “Find incoming purchase documents, inspect accounting links and assess duplicate candidates.” |
-| Booking preparation and reporting | “Check this supplier’s defaults, VAT codes and journal-period locks” or “Show movement on this G/L account.” |
+| Booking preparation and reporting | “Preflight this explicit purchase proposal” or “Show movement on this G/L account.” |
 
 See [purchase duplicate assessment and booking preparation](docs/booking.md) for source coverage and interpretation limits.
 

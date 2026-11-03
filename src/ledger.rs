@@ -11,8 +11,7 @@ use crate::financial::{ExactDate, Money};
 use crate::invoice;
 use crate::store::Administration;
 
-const ACCOUNT_FIELDS: &str =
-    "ID,Division,Code,Description,Type,TypeDescription,BalanceSide,BalanceType,IsBlocked";
+pub(crate) const ACCOUNT_FIELDS: &str = "ID,Division,Code,Description,Type,TypeDescription,BalanceSide,BalanceType,IsBlocked,UseCostcenter,UseCostunit,Costcenter,Costunit,VATCode";
 const LINE_FIELDS: &str = "ID,EntryID,Division,GLAccount,GLAccountCode,Account,AccountCode,AccountName,EntryNumber,FinancialYear,FinancialPeriod,JournalCode,JournalDescription,LineNumber,Type,Status,Date,AmountDC,AmountFC,Currency,InvoiceNumber,YourRef,Description";
 
 #[derive(Default, Deserialize, Serialize, JsonSchema)]
@@ -76,22 +75,28 @@ pub struct GetLedgerReport {
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
-struct GlAccount {
+pub(crate) struct GlAccount {
     #[serde(rename(deserialize = "ID"))]
-    id: Uuid,
-    division: u32,
-    code: String,
+    pub(crate) id: Uuid,
+    pub(crate) division: u32,
+    pub(crate) code: String,
     description: Option<String>,
     #[serde(rename(deserialize = "Type"))]
-    type_code: Option<i32>,
+    pub(crate) type_code: Option<i32>,
     type_description: Option<String>,
     balance_side: Option<String>,
     balance_type: Option<String>,
-    is_blocked: Option<bool>,
+    pub(crate) is_blocked: Option<bool>,
+    pub(crate) use_costcenter: Option<u8>,
+    pub(crate) use_costunit: Option<u8>,
+    pub(crate) costcenter: Option<String>,
+    pub(crate) costunit: Option<String>,
+    #[serde(rename(deserialize = "VATCode"))]
+    pub(crate) vat_code: Option<String>,
 }
 
 impl GlAccount {
-    fn validate(&self, division: u32) -> Result<()> {
+    pub(crate) fn validate(&self, division: u32) -> Result<()> {
         ensure!(
             self.division == division
                 && !self.id.is_nil()

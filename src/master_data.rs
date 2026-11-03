@@ -13,6 +13,11 @@ use crate::invoice::number_string;
 use crate::store::Administration;
 
 mod items;
+mod preflight;
+
+pub use preflight::{
+    PreflightPurchaseBooking, PurchaseBookingPreflight, preflight_purchase_booking,
+};
 
 pub use items::{
     GetItemDetails, Item, ItemDetails, SearchSupplierItems, SupplierItemsResult, Unit,
@@ -225,12 +230,10 @@ struct VatPercentage {
     percentage: Option<serde_json::Number>,
 }
 
-pub async fn search_vat_codes(
+async fn load_vat_codes(
     client: &ExactClient,
     administration: &Administration,
-    args: SearchMasterData,
-) -> Result<SearchResult<VatCode>> {
-    args.validate()?;
+) -> Result<Vec<Record<VatCode>>> {
     let mut codes: Vec<Record<VatCode>> = load_catalog(client, administration, "vat/VATCodes", "Type,VATTransactionType,IsBlocked,Charged,CalculationBasis,TaxReturnType,Percentage,GLToClaim,GLToPay", "Financial accounting").await?;
     let mut url = client.base_url().join(&format!(
         "/api/v1/{}/vat/VatPercentages",
@@ -275,6 +278,16 @@ pub async fn search_vat_codes(
         });
         code.details.percentages = rates;
     }
+    Ok(codes)
+}
+
+pub async fn search_vat_codes(
+    client: &ExactClient,
+    administration: &Administration,
+    args: SearchMasterData,
+) -> Result<SearchResult<VatCode>> {
+    args.validate()?;
+    let codes = load_vat_codes(client, administration).await?;
     search_result(client, administration, args, codes, "vat_codes", "calculation_type: B=base only (0%), E=excluding, I=including, N=no VAT. transaction_type: B=both, P=purchase, S=sales. Charged=true on purchases creates both VAT-to-pay and VAT-to-claim lines; it is not proof of supplier-charged VAT. calculation_basis: 0=gross, 1=gross plus another tax. percentage is the current active rate; percentages includes dated historical/extra-duty rates (type_code 0=normal, 1=extra duty). Numeric values are raw decimal strings, not rescaled. Missing dates/rates remain unknown. No rate is automatically selected for a booking date, combined with extra duty or treated as tax advice.").await
 }
 

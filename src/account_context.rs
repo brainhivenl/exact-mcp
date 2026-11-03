@@ -29,8 +29,8 @@ pub struct BookingAccount {
     code: String,
     name: Option<String>,
     #[serde(rename(deserialize = "Blocked"))]
-    is_blocked: Option<bool>,
-    is_supplier: Option<bool>,
+    pub(crate) is_blocked: Option<bool>,
+    pub(crate) is_supplier: Option<bool>,
     #[serde(rename(deserialize = "IsSales"))]
     sales_allowed: Option<bool>,
     #[serde(rename(deserialize = "Status"))]
@@ -42,23 +42,23 @@ pub struct BookingAccount {
     #[serde(rename(deserialize = "VATLiability"))]
     vat_liability: Option<String>,
     chamber_of_commerce: Option<String>,
-    start_date: Option<ExactDate>,
-    end_date: Option<ExactDate>,
+    pub(crate) start_date: Option<ExactDate>,
+    pub(crate) end_date: Option<ExactDate>,
     #[serde(rename(deserialize = "GLAccountPurchase"))]
-    gl_account_purchase_id: Option<Uuid>,
+    pub(crate) gl_account_purchase_id: Option<Uuid>,
     #[serde(rename(deserialize = "GLAccountSales"))]
     gl_account_sales_id: Option<Uuid>,
     #[serde(rename(deserialize = "GLAP"))]
-    gl_accounts_payable_id: Option<Uuid>,
+    pub(crate) gl_accounts_payable_id: Option<Uuid>,
     #[serde(rename(deserialize = "GLAR"))]
-    gl_accounts_receivable_id: Option<Uuid>,
+    pub(crate) gl_accounts_receivable_id: Option<Uuid>,
     #[serde(rename(deserialize = "PurchaseVATCode"))]
-    purchase_vat_code: Option<String>,
+    pub(crate) purchase_vat_code: Option<String>,
     #[serde(rename(deserialize = "SalesVATCode"))]
     sales_vat_code: Option<String>,
-    payment_condition_purchase: Option<String>,
+    pub(crate) payment_condition_purchase: Option<String>,
     payment_condition_sales: Option<String>,
-    purchase_currency: Option<String>,
+    pub(crate) purchase_currency: Option<String>,
     sales_currency: Option<String>,
     #[serde(serialize_with = "number_string")]
     discount_purchase: Option<serde_json::Number>,
