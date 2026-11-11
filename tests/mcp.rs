@@ -200,16 +200,23 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 34);
+    assert_eq!(tools.len(), 36);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
             tool["name"] != "download_invoice_pdf"
                 && tool["name"] != "download_purchase_document_pdf"
+                && tool["name"] != "preview_bank_ui_classification"
+                && tool["name"] != "execute_bank_ui_classification"
         );
-        assert_eq!(tool["annotations"]["destructiveHint"], false);
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            tool["name"] == "execute_bank_ui_classification"
+        );
         if tool["name"] == "download_invoice_pdf"
             || tool["name"] == "download_purchase_document_pdf"
+            || tool["name"] == "preview_bank_ui_classification"
+            || tool["name"] == "execute_bank_ui_classification"
         {
             assert_eq!(tool["annotations"]["idempotentHint"], false);
         }
@@ -217,6 +224,8 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "preview_bank_ui_classification"
+                    | "execute_bank_ui_classification"
                     | "preview_bank_gl_xml"
                     | "propose_bank_transaction_handling"
                     | "preflight_purchase_booking"

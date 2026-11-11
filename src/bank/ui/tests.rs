@@ -1,7 +1,10 @@
 use super::*;
 use crate::store::{Session, Store, Tokens};
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -307,12 +310,12 @@ fn inspect_replies(s: &Snapshot) -> Vec<Reply> {
     ]);
     replies
 }
-struct Server {
+pub(crate) struct Server {
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Vec<Url>>,
 }
 impl Server {
-    async fn finish(self) -> Vec<Url> {
+    pub(crate) async fn finish(self) -> Vec<Url> {
         self.stop.send(()).unwrap();
         self.task.await.unwrap()
     }
@@ -403,18 +406,28 @@ async fn fixture(replies: Vec<Reply>) -> (tempfile::TempDir, Server, ExactClient
     (d, Server { stop, task }, client)
 }
 
+#[derive(Default)]
+struct Count(AtomicUsize);
+impl Count {
+    fn get(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+    fn set(&self, value: usize) {
+        self.0.store(value, Ordering::SeqCst);
+    }
+}
 struct FakeBrowser {
-    forms: RefCell<VecDeque<browser::Form>>,
-    saves: Cell<usize>,
-    fills: Cell<usize>,
+    forms: Mutex<VecDeque<browser::Form>>,
+    saves: Count,
+    fills: Count,
     save_error: bool,
 }
 impl FakeBrowser {
     fn new(plan: &Plan) -> Self {
         Self {
-            forms: RefCell::new([form(plan, false), form(plan, true), form(plan, true)].into()),
-            saves: Cell::new(0),
-            fills: Cell::new(0),
+            forms: Mutex::new([form(plan, false), form(plan, true), form(plan, true)].into()),
+            saves: Count::default(),
+            fills: Count::default(),
             save_error: false,
         }
     }
@@ -425,7 +438,8 @@ impl Driver for FakeBrowser {
     }
     async fn read_form(&self) -> Result<browser::Form> {
         self.forms
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .pop_front()
             .context("Missing fake form")
     }
@@ -695,4 +709,282 @@ fn browser_dom_line_endings_are_normalized_but_api_preservation_is_exact() {
     after.native.get_mut(&id(201)).unwrap()["Notes"] = json!("Original\nnote");
     assert_eq!(outcome(&p, &after).unwrap(), "uncertain");
     assert!(!include_str!("form.js").contains("fetch("));
+}
+
+struct TestAsk {
+    answers: Mutex<VecDeque<Option<bool>>>,
+    questions: Mutex<Vec<String>>,
+}
+impl TestAsk {
+    fn new(answers: Vec<Option<bool>>) -> Self {
+        Self {
+            answers: Mutex::new(answers.into()),
+            questions: Mutex::new(vec![]),
+        }
+    }
+}
+impl conversation::Ask for TestAsk {
+    async fn ask(&self, message: &str) -> Result<Option<bool>> {
+        self.questions.lock().unwrap().push(message.into());
+        self.answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .context("Unexpected confirmation request")
+    }
+}
+struct ConversationTestBrowser {
+    inner: FakeBrowser,
+    authenticated: std::sync::atomic::AtomicBool,
+    opened: Count,
+    selected: Count,
+}
+impl ConversationTestBrowser {
+    fn new(p: &Plan, authenticated: bool) -> Self {
+        let inner = FakeBrowser::new(p);
+        inner.forms.lock().unwrap().push_front(form(p, false));
+        Self {
+            inner,
+            authenticated: std::sync::atomic::AtomicBool::new(authenticated),
+            opened: Count::default(),
+            selected: Count::default(),
+        }
+    }
+}
+impl Driver for ConversationTestBrowser {
+    async fn open_editor(&self, p: &Plan) -> Result<()> {
+        ensure!(
+            self.authenticated.load(Ordering::SeqCst),
+            "Manual login needed"
+        );
+        self.inner.open_editor(p).await
+    }
+    async fn read_form(&self) -> Result<browser::Form> {
+        self.inner.read_form().await
+    }
+    async fn set_gl(&self, p: &Plan) -> Result<()> {
+        self.inner.set_gl(p).await
+    }
+    async fn diagnostics(&self) -> Result<Vec<Value>> {
+        self.inner.diagnostics().await
+    }
+    async fn save(&self) -> Result<()> {
+        self.inner.save().await
+    }
+}
+impl conversation::ConversationBrowser for ConversationTestBrowser {
+    async fn open_session(&self, _: &Plan) -> Result<String> {
+        self.opened.set(self.opened.get() + 1);
+        Ok("0".repeat(32))
+    }
+    async fn select_session(&self, target: &str) -> Result<()> {
+        ensure!(target == "0".repeat(32), "Wrong tab");
+        self.selected.set(self.selected.get() + 1);
+        Ok(())
+    }
+    async fn pending_login(&self) -> Result<bool> {
+        Ok(!self.authenticated.load(Ordering::SeqCst))
+    }
+}
+fn execute_args(p: &Plan) -> conversation::ExecuteBankUi {
+    conversation::ExecuteBankUi {
+        preview_id: p.id.clone(),
+        confirmation: None,
+        resume_after_login: false,
+    }
+}
+fn host_confirmation(approved: bool) -> conversation::HostConfirmation {
+    conversation::HostConfirmation {
+        approved,
+        via: "any-user-ask-plugin".into(),
+        user_response: if approved {
+            "Approve this exact preview".into()
+        } else {
+            "Cancel".into()
+        },
+    }
+}
+async fn saved_plan(directory: &Path, client: &ExactClient) -> Plan {
+    let mut p = plan();
+    p.before = inspect(client, &administration(), &selection(), id(1001))
+        .await
+        .unwrap();
+    let root = artifact_root(directory).unwrap();
+    let folder = root.join(&p.id);
+    private_directory(&folder).unwrap();
+    write_new(&folder.join("plan.json"), &p).unwrap();
+    p
+}
+
+pub(crate) async fn mcp_confirmation_fixture() -> (tempfile::TempDir, Server, Value) {
+    let mut replies = vec![json_reply(
+        "/api/v1/42/financialtransaction/TransactionLines",
+        vec![json!({"ID":id(201),"EntryID":id(1001),"Division":42})],
+    )];
+    replies.extend(inspect_replies(&snapshot()));
+    replies.extend(capture_replies(&snapshot()));
+    replies.extend(inspect_replies(&snapshot()));
+    let (d, server, _client) = fixture(replies).await;
+    (d, server, serde_json::to_value(selection()).unwrap())
+}
+
+#[tokio::test]
+async fn conversation_without_native_ui_returns_preview_question_and_never_opens_browser() {
+    let mut replies = inspect_replies(&snapshot());
+    replies.extend(inspect_replies(&snapshot()));
+    let (d, server, client) = fixture(replies).await;
+    let p = saved_plan(d.path(), &client).await;
+    let ask = TestAsk::new(vec![None]);
+    let browser = ConversationTestBrowser::new(&p, true);
+    let result =
+        conversation::execute_with(&client, &administration(), execute_args(&p), &ask, &browser)
+            .await
+            .unwrap();
+    assert_eq!(result["status"], "requires_confirmation");
+    assert_eq!(result["preview"]["preview_id"], p.id);
+    assert_eq!(browser.opened.get(), 0);
+    assert_eq!(browser.inner.saves.get(), 0);
+    assert!(
+        !d.path()
+            .join("bank-ui")
+            .join(&p.id)
+            .join("approved.json")
+            .exists()
+    );
+    assert!(ask.questions.lock().unwrap()[0].contains(&p.id));
+    let mut args = execute_args(&p);
+    args.confirmation = Some(host_confirmation(false));
+    let result = conversation::execute_with(&client, &administration(), args, &ask, &browser)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "cancelled");
+    assert_eq!(server.finish().await.len(), 22);
+}
+
+#[tokio::test]
+async fn conversation_native_decline_is_final_without_falling_back_to_terminal_or_host_approval() {
+    let mut replies = inspect_replies(&snapshot());
+    replies.extend(inspect_replies(&snapshot()));
+    let (d, server, client) = fixture(replies).await;
+    let p = saved_plan(d.path(), &client).await;
+    let ask = TestAsk::new(vec![Some(false)]);
+    let browser = ConversationTestBrowser::new(&p, true);
+    let result =
+        conversation::execute_with(&client, &administration(), execute_args(&p), &ask, &browser)
+            .await
+            .unwrap();
+    assert_eq!(result["status"], "cancelled");
+    let result =
+        conversation::execute_with(&client, &administration(), execute_args(&p), &ask, &browser)
+            .await
+            .unwrap();
+    assert_eq!(result["status"], "cancelled");
+    assert_eq!(browser.opened.get(), 0);
+    assert_eq!(server.finish().await.len(), 22);
+}
+
+#[tokio::test]
+async fn conversation_native_or_any_host_confirmation_executes_once_without_a_terminal() {
+    for native in [true, false] {
+        let mut replies = inspect_replies(&snapshot());
+        for _ in 0..4 {
+            replies.extend(inspect_replies(&snapshot()));
+        }
+        replies.extend(capture_replies(&applied(&plan())));
+        let (d, server, client) = fixture(replies).await;
+        let p = saved_plan(d.path(), &client).await;
+        let ask = TestAsk::new(if native { vec![Some(true)] } else { vec![] });
+        let browser = ConversationTestBrowser::new(&p, true);
+        let mut args = execute_args(&p);
+        if !native {
+            args.confirmation = Some(host_confirmation(true));
+        }
+        let result = conversation::execute_with(&client, &administration(), args, &ask, &browser)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "verified");
+        assert_eq!(browser.inner.saves.get(), 1);
+        assert_eq!(browser.opened.get(), 1);
+        assert!(!d.path().join("bank-ui/active-conversation.json").exists());
+        let result = conversation::execute_with(
+            &client,
+            &administration(),
+            execute_args(&p),
+            &ask,
+            &browser,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["status"], "verified");
+        assert_eq!(browser.inner.saves.get(), 1);
+        assert_eq!(ask.questions.lock().unwrap().len(), usize::from(native));
+        assert_eq!(server.finish().await.len(), 60);
+    }
+}
+
+#[tokio::test]
+async fn conversation_login_can_pause_and_resume_same_approval_without_reopening_or_reapproving() {
+    let mut replies = inspect_replies(&snapshot());
+    for _ in 0..5 {
+        replies.extend(inspect_replies(&snapshot()));
+    }
+    replies.extend(capture_replies(&applied(&plan())));
+    let (d, server, client) = fixture(replies).await;
+    let p = saved_plan(d.path(), &client).await;
+    let ask = TestAsk::new(vec![None]);
+    let browser = ConversationTestBrowser::new(&p, false);
+    let mut args = execute_args(&p);
+    args.confirmation = Some(host_confirmation(true));
+    let result = conversation::execute_with(&client, &administration(), args, &ask, &browser)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "requires_login");
+    assert_eq!(browser.opened.get(), 1);
+    assert_eq!(browser.inner.saves.get(), 0);
+    browser.authenticated.store(true, Ordering::SeqCst);
+    let mut args = execute_args(&p);
+    args.resume_after_login = true;
+    let result = conversation::execute_with(&client, &administration(), args, &ask, &browser)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "verified");
+    assert_eq!(browser.opened.get(), 1);
+    assert_eq!(browser.selected.get(), 1);
+    assert_eq!(browser.inner.saves.get(), 1);
+    assert_eq!(ask.questions.lock().unwrap().len(), 1);
+    assert_eq!(server.finish().await.len(), 71);
+}
+
+#[tokio::test]
+async fn conversation_resume_is_not_approval_and_expired_paused_runs_can_be_cancelled() {
+    let mut replies = inspect_replies(&snapshot());
+    replies.extend(inspect_replies(&snapshot()));
+    let (d, server, client) = fixture(replies).await;
+    let mut p = saved_plan(d.path(), &client).await;
+    let ask = TestAsk::new(vec![]);
+    let browser = ConversationTestBrowser::new(&p, true);
+    let mut args = execute_args(&p);
+    args.resume_after_login = true;
+    assert!(
+        conversation::execute_with(&client, &administration(), args, &ask, &browser)
+            .await
+            .is_err()
+    );
+    assert_eq!(browser.opened.get(), 0);
+    p.created_at = oauth::now().unwrap() - 1801;
+    let folder = d.path().join("bank-ui").join(&p.id);
+    fs::write(folder.join("plan.json"), serde_json::to_vec(&p).unwrap()).unwrap();
+    write_new(
+        &d.path().join("bank-ui/active-conversation.json"),
+        &json!({"preview_id":p.id}),
+    )
+    .unwrap();
+    let mut args = execute_args(&p);
+    args.confirmation = Some(host_confirmation(false));
+    let result = conversation::execute_with(&client, &administration(), args, &ask, &browser)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "cancelled");
+    assert!(!d.path().join("bank-ui/active-conversation.json").exists());
+    assert_eq!(server.finish().await.len(), 22);
 }

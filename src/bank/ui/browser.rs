@@ -84,15 +84,37 @@ impl AgentBrowser {
         Ok(())
     }
 
-    pub(super) async fn open_login(&self, plan: &Plan) -> Result<()> {
+    pub(super) async fn open_login(&self, plan: &Plan) -> Result<String> {
         let url = format!(
             "{}/docs/MenuPortal.aspx?SsC=1&_Division_={}",
             plan.before.origin, plan.before.division
         );
         validate_origin(&plan.before.origin)?;
-        self.command_inner(&["tab", "new", &url], None, true)
+        let result = self
+            .command_inner(&["tab", "new", &url], None, true)
             .await?;
+        Ok(text(&result, "targetId")?.to_owned())
+    }
+
+    pub(super) async fn select_tab(&self, target: &str) -> Result<()> {
+        ensure!(
+            target.len() == 32 && target.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Invalid saved browser tab binding"
+        );
+        self.command(&["tab", target], None).await?;
+        self.command(&["frame", "main"], None).await?;
         Ok(())
+    }
+
+    pub(super) async fn login_pending(&self) -> Result<bool> {
+        let result = self.command(&["eval", "--stdin"], Some(r#"(() => ({host:location.hostname,path:location.pathname,login:!!document.querySelector('input[type="password"],input[type="email"],input[autocomplete="username"]')}))()"#)).await?;
+        let value = &result["result"];
+        Ok(matches!(
+            value["host"].as_str(),
+            Some("login.exact.com" | "identity.exact.com")
+        ) || (value["host"] == "start.exactonline.nl"
+            && value["path"] == "/"
+            && value["login"] == true))
     }
 
     async fn no_dialog(&self) -> Result<()> {

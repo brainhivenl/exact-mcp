@@ -48,7 +48,9 @@ enum Command {
         #[arg(last = true)]
         args: Vec<OsString>,
     },
-    #[command(about = "Serve read-only financial MCP tools over stdin/stdout.")]
+    #[command(
+        about = "Serve financial MCP queries and explicitly confirmed browser bank classification over stdin/stdout."
+    )]
     Serve,
     #[command(about = "Authorize this app or inspect the locally stored session.")]
     Auth {
@@ -66,7 +68,7 @@ enum Command {
         command: BankConfigCommand,
     },
     #[command(
-        about = "Preview or explicitly approve a browser-assisted existing bank expense classification. Not exposed through MCP."
+        about = "Optional terminal companions to the conversational browser-classification MCP tools."
     )]
     BankUi {
         #[command(subcommand)]

@@ -6,18 +6,22 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 mod browser;
+pub(crate) mod conversation;
 use browser::Driver;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-#[derive(Clone, Deserialize, Serialize, clap::Args)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema, clap::Args)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Selection {
     #[arg(long)]
+    #[schemars(with = "String")]
     control_id: Uuid,
     #[arg(long)]
+    #[schemars(with = "String")]
     pending_id: Uuid,
     #[arg(long)]
+    #[schemars(with = "String")]
     destination_id: Uuid,
     #[arg(
         long,
@@ -567,57 +571,63 @@ pub(crate) async fn prepare(directory: PathBuf, args: Selection) -> Result<()> {
     .await?;
     let result = async {
         let administration = client.pin_administration()?;
-        let pending = rows(
-            &client,
-            administration.code,
-            "financialtransaction/TransactionLines",
-            "ID,EntryID,Division",
-            &format!("ID eq guid'{}'", args.pending_id),
-        )
-        .await?;
-        ensure!(
-            pending.len() == 1
-                && identifier(&pending[0], "ID")? == args.pending_id
-                && integer(&pending[0], "Division")? == i64::from(administration.code),
-            "Pending posting is not uniquely verified"
-        );
-        let entry = identifier(&pending[0], "EntryID")?;
-        let before = inspect(&client, &administration, &args, entry).await?;
-        ensure!(
-            capture(&client, administration.code, entry).await? == before.snapshot,
-            "Source changed during preview"
-        );
-        let mut random = [0u8; 16];
-        getrandom::fill(&mut random).context("Cannot generate preview ID")?;
-        let id = random
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let root = artifact_root(&directory)?;
-        let folder = root.join(&id);
-        private_directory(&folder)?;
-        let plan = Plan {
-            version: 1,
-            id,
-            created_at: oauth::now()?,
-            selection: args,
-            before,
-        };
-        ensure!(
-            serde_json::to_vec(&plan)?.len() <= 16 * 1024 * 1024,
-            "Preview artifact exceeds supported size"
-        );
-        write_new(&folder.join("plan.json"), &plan)?;
-        println!("{}", serde_json::to_string_pretty(&preview(&plan)?)?);
-        println!(
-            "Preview saved privately. Execute interactively with: exact-mcp bank-ui execute {}",
-            plan.id
-        );
+        let value = create_preview(&client, &administration, args).await?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        println!("Preview saved. Ask for confirmation in the conversation, then use execute_bank_ui_classification with preview_id {}. The terminal command is optional.", value["preview_id"].as_str().context("Missing preview ID")?);
         Ok::<_, anyhow::Error>(())
-    }
-    .await;
+    }.await;
     client.shutdown().await;
     result
+}
+
+pub(crate) async fn create_preview(
+    client: &ExactClient,
+    administration: &Administration,
+    args: Selection,
+) -> Result<Value> {
+    validate_selection(&args)?;
+    let pending = rows(
+        client,
+        administration.code,
+        "financialtransaction/TransactionLines",
+        "ID,EntryID,Division",
+        &format!("ID eq guid'{}'", args.pending_id),
+    )
+    .await?;
+    ensure!(
+        pending.len() == 1
+            && identifier(&pending[0], "ID")? == args.pending_id
+            && integer(&pending[0], "Division")? == i64::from(administration.code),
+        "Pending posting is not uniquely verified"
+    );
+    let entry = identifier(&pending[0], "EntryID")?;
+    let before = inspect(client, administration, &args, entry).await?;
+    ensure!(
+        capture(client, administration.code, entry).await? == before.snapshot,
+        "Source changed during preview"
+    );
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).context("Cannot generate preview ID")?;
+    let id = random
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let root = artifact_root(client.directory())?;
+    let folder = root.join(&id);
+    private_directory(&folder)?;
+    let plan = Plan {
+        version: 1,
+        id,
+        created_at: oauth::now()?,
+        selection: args,
+        before,
+    };
+    ensure!(
+        serde_json::to_vec(&plan)?.len() <= 16 * 1024 * 1024,
+        "Preview artifact exceeds supported size"
+    );
+    write_new(&folder.join("plan.json"), &plan)?;
+    preview(&plan)
 }
 
 fn confirm(message: &str, expected: &str) -> Result<()> {
@@ -672,6 +682,10 @@ pub(crate) async fn execute(directory: PathBuf, id: String) -> Result<()> {
     lock.try_lock()
         .context("Another browser executor is running")?;
     ensure!(
+        !root.join("active-conversation.json").exists(),
+        "A conversational execution is awaiting login or completion; resume/cancel it through the conversation"
+    );
+    ensure!(
         !folder.join("approved.json").exists(),
         "Approval already consumed; inspect prior outcome and prepare a fresh proposal"
     );
@@ -696,6 +710,7 @@ pub(crate) async fn execute(directory: PathBuf, id: String) -> Result<()> {
             write_new(&folder.join("00-browser-ready.json"), &json!({"at":oauth::now()?,"browser_account_verification":"human_confirmed_not_programmatically_verified","expected_modifier_user_id":plan.before.actor}))?;
             valid_time(&plan)?;
             run_approved(&browser, &client, &administration, &plan, &folder).await?;
+            println!("Outcome: verified. Browser left open; private evidence: {}", folder.display());
             Ok::<_, anyhow::Error>(())
         }.await;
         if result.is_err() && !folder.join("result.json").exists() {
@@ -809,10 +824,6 @@ async fn run_approved(
         &folder.join("result.json"),
         &json!({"status":status,"verified_at":oauth::now()?,"evidence":evidence,"retry_allowed":false}),
     )?;
-    println!(
-        "Outcome: {status}. Browser left open; private evidence: {}",
-        folder.display()
-    );
     ensure!(
         status == "verified",
         "Outcome is not verified; inspect evidence manually. No automatic retry/rollback is permitted"

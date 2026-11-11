@@ -73,7 +73,7 @@ With Pi installed on `PATH`:
 nix run .#pi
 ```
 
-This registers the built server locally as `exact` and opens an interactive Pi session. Check the connection with `/mcp`.
+This registers the built server locally as `exact` and opens an interactive Pi session. Check the connection with `/mcp`. For bank-expense classification, the assistant shows a preview and asks for confirmation through native MCP, any available ask tool/plugin, or explicit chat; no terminal confirmation is required.
 
 For another MCP client, build with `nix build` and configure its stdio server:
 

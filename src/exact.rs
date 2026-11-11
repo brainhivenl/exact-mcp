@@ -69,6 +69,10 @@ impl ExactClient {
         Ok(administration)
     }
 
+    pub(crate) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
     pub fn base_url(&self) -> &Url {
         &self.base_url
     }

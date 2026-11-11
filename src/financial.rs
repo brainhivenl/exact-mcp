@@ -369,6 +369,21 @@ impl Backend {
         })
     }
 
+    pub(crate) async fn preview_bank_ui_classification(
+        &self,
+        args: crate::bank::ui::Selection,
+    ) -> Result<serde_json::Value> {
+        crate::bank::ui::create_preview(&self.client, &self.administration, args).await
+    }
+
+    pub(crate) async fn execute_bank_ui_classification(
+        &self,
+        args: crate::bank::ui::conversation::ExecuteBankUi,
+        ask: &impl crate::bank::ui::conversation::Ask,
+    ) -> Result<serde_json::Value> {
+        crate::bank::ui::conversation::execute(&self.client, &self.administration, args, ask).await
+    }
+
     pub async fn shutdown(&self) {
         self.client.shutdown().await;
     }

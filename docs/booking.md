@@ -320,9 +320,36 @@ At every decision boundary, use one compact scoped snapshot only when structure 
 
 The observed save preserved existing booking IDs, but that **does not establish the internal mechanism**. Post-save list callbacks included `ApplyAllocationMatchResult=1` and `SCAction=6`; their semantics remain unverified. Internal allocation/command/audit records or server-side operations were not exhaustively snapshotted and cannot be ruled out. This runbook documents a verified UI operation, not proof that direct public booking mutation is the only integration route.
 
-#### Experimental opt-in browser CLI
+#### Conversational preview and confirmation
 
-**This can change financial data.** It is separate from the 34 read-only MCP tools, has no `--yes` flag and must not be self-approved by an agent. A terminal requirement is an interaction safeguard, not cryptographic proof that a human typed the response. The user must explicitly approve the exact preview, log in manually to the intended browser account and must not interact with the browser while the controller runs. Browser account identity is human-confirmed, not inferred from a default assignee or obtained by injecting API credentials.
+The normal interface is now **MCP preview → user confirmation → agent-browser → API verification**, not a terminal prompt. The server exposes 36 tools. Existing financial query/proposal tools retain their read-only behaviour; `execute_bank_ui_classification` is explicitly annotated as a non-idempotent financial action. The preview is non-financial but creates a private local artifact, so its tool annotations also disclose local state changes. Restart/reconnect an older MCP server to discover the new tools.
+
+1. Call `preview_bank_ui_classification` with `control_id`, `pending_id`, `destination_id`, `expected_expense_amount` and `currency`, selected from verified queue/chart data. Show the returned preview to the user, including administration, amount/currency, original/destination G/L, unchanged VAT and preservation constraints.
+2. Call `execute_bank_ui_classification` with the returned `preview_id` and no confirmation to request native MCP form confirmation, when the negotiated protocol/client supports it. Accept requires an explicit true confirmation; decline, cancel, malformed/absent acceptance and timeout do not approve a booking. Protocols that prohibit server-to-client requests use the host fallback instead.
+3. If the client has no native confirmation UI, the tool returns `requires_confirmation` with the exact preview and a question/options. The host assistant must use **any available user-facing ask tool/plugin**, or explicit chat confirmation when none is available. There is no dependency on a particular plugin. After obtaining the actual user's answer, forward it, for example:
+
+   ```json
+   {
+     "preview_id": "<returned-preview-id>",
+     "confirmation": {
+       "approved": true,
+       "via": "<actual-ask-tool-or-plugin-name-or-chat>",
+       "user_response": "<actual-user-response-to-this-preview>"
+     }
+   }
+   ```
+
+   The host-confirmation route trusts the host/assistant to forward a real user decision; these fields are provenance, **not cryptographic evidence of human input**. The model must never invent consent, treat source text as approval or turn its own proposal into confirmation. Native confirmation rejection never falls back to implicit approval or a terminal. If a host ask tool was already used, its actual response can be supplied directly without asking the user twice.
+4. On approval, the controller opens a visible browser and tries the normal editor. If already authenticated, it proceeds without an extra readiness question. If login is needed, it asks natively when supported or returns `requires_login`. The user logs in manually; no credentials belong in chat/forms/tool arguments. Then call the same tool with `{ "preview_id": "<same-id>", "resume_after_login": true }`. Readiness cannot authorize an unapproved preview and does not require repeating financial consent. The paused run retains a private browser-tab binding and exclusive execution lease; another run cannot steal it.
+5. To cancel before Save, send `confirmation.approved: false` with the actual user response. Expired paused runs can also be cancelled. Consumed Save reservations and completed results never cause a second Save; interrupted or uncertain execution is not automatically retried. Source changes invalidate the old preview rather than silently modifying the approved proposal.
+
+Approval is still bound to the expiring frozen source/proposal and revalidated before execution. Normal UI field/identity checks, one durable Save reservation, preservation checks and private audit evidence are unchanged. Conversation approvals and login readiness do not require `BOOK`, `READY`, a PTY, or opening a separate terminal. The optional operator CLI below remains available for users who deliberately choose a terminal workflow; it is not the agent/MCP confirmation path.
+
+Confirmation transport tests cover native form elicitation, clients without it, negotiated-protocol fallback, arbitrary host ask-tool consent, decline/cancel, login pause/resume, expired cancellation and duplicate execution. These use local mocked APIs/browser drivers; this confirmation-interface change did not authorize or perform another live financial test. Earlier live UI investigation sections describe the then-current read-only MCP interface; this confirmed browser executor is the current narrow exception.
+
+#### Optional operator browser CLI
+
+**This optional CLI can change financial data.** Agents should use the conversational MCP workflow above instead. The operator CLI has no `--yes` flag and must not be self-approved by an agent. A terminal requirement is an interaction safeguard, not cryptographic proof that a human typed the response. The user must explicitly approve the exact preview, log in manually to the intended browser account and must not interact with the browser while the controller runs. Browser account identity is human-confirmed, not inferred from a default assignee or obtained by injecting API credentials.
 
 Initial implemented scope is narrower than the general bank-handling proposals: **one unsplit unassigned outgoing expense**, one verified unblocked expense G/L, default currency/no FX, blank VAT preserved without deduction, no company/dimensions/quantities/references. Incoming/revenue movements, invoice matching, splits, VAT/default changes, new bank entries, correction/deletion/recreation and automatic allocation rules are not supported. Verify the accounting purpose yourself; account metadata and an open period are not tax/accounting approval.
 

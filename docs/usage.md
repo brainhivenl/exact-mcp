@@ -62,10 +62,13 @@ Access depends on both the authorizing user/app and the administration’s Exact
 | Accounting invoice search/details | **Crm accounts**, **Financial accounting**, **Organization administration** |
 | Unprocessed commercial sales invoices | **Sales invoices**, **Crm accounts**, **Organization administration** |
 | Purchase-document discovery / PDFs | **Organization documents**; company filtering also uses **Crm accounts**, accounting-link inspection uses **Financial accounting** |
+| Purchase duplicate assessment | **Crm accounts**, **Financial accounting**, **Organization documents** |
+| Direct-G/L purchase preflight | **Crm accounts**, **Financial accounting**, **Financial generalledgers**, **Financial currencies**, **Organization administration**, **Organization documents**; explicitly selected dimensions/payment conditions require their catalog scopes |
 | Accounting-invoice PDFs | Accounting invoice access plus **Organization documents**; sales discovery also uses **Sales invoices** |
 | Recorded invoice matching | XML **MatchSets** download access, **Crm accounts**, **Financial accounting**, **Organization administration** |
 | Cashflow posting details and G/L reports | **Financial accounting**, **Financial generalledgers**, **Organization administration** |
 | Reconstructed bank queue | **Financial accounting**, **Financial generalledgers**, **Financial payables**, **Financial receivables**, **Organization administration** |
+| Approved browser expense classification | **Financial accounting**, **Financial generalledgers**, **Organization administration**, XML **MatchSets** download access, plus the signed-in user’s normal UI bank-edit rights |
 | VAT and financial periods | **Financial accounting** |
 | Journals / journal-period locks | **Financial generalledgers**; period locks also use **Financial accounting** |
 | Payment conditions | **Financial cashflow** |
@@ -90,6 +93,8 @@ Then call `get_bank_transactions_to_handle` with `{}`. Explicit `unassigned_gl_a
 
 The queue combines configured unassigned postings with current open payable/receivable bank postings, following explicit offset links to bank control lines. Inspect `unresolved_items` and the reported reconstruction basis: an empty page with unresolved evidence does not mean nothing needs handling. Accounting status 20 is not a queue predicate. No assignment, matching or handling is executed.
 
+For read-only proposals, duplicate coverage, preflight checks and the separately approved browser executor, see [booking preparation and bank handling](booking.md). Browser execution uses an expiring preview and confirmation in the conversation, not a terminal prompt.
+
 ## Reading results correctly
 
 - Resolve ambiguous companies, invoices and attachments explicitly, rather than taking the first match. Reuse the returned UUIDs and accounting identity for drill-down. A commercial sales `InvoiceID` is not an accounting `EntryID`.
@@ -109,4 +114,4 @@ Ordinary GET requests retry HTTP 429 at most twice, with at most 60 seconds of c
 
 PDF downloads fetch only an explicitly selected existing attachment, using checked associations and a fixed authenticated endpoint without redirects. Files are limited to 20 MiB, checked for PDF markers, and saved without overwriting under `<data-dir>/downloads/<division>/`. Returned paths refer to the MCP server’s machine. Files are not opened automatically and remain until removed; marker checks are not authenticity verification or malware scanning. Repeated downloads create new files.
 
-There is no persistent financial cache or snapshot. API pages are restricted to the saved origin’s `/api/v1/` path. Financial source text and downloaded content can be sensitive and remain untrusted even when retrieved successfully.
+There is no reusable financial query cache. Browser approval plans and audit records contain private frozen financial snapshots under `<data-dir>/bank-ui/`; they are not a general query cache, remain sensitive and must not be shared raw. See [the browser workflow](booking.md#conversational-preview-and-confirmation) for approval, cancellation and uncertain-outcome safeguards. API pages are restricted to the saved origin’s `/api/v1/` path. Financial source text and downloaded content can be sensitive and remain untrusted even when retrieved successfully.
