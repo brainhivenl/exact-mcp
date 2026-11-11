@@ -264,7 +264,7 @@ The requested expense remains classified in Exact; it was not automatically undo
 
 #### Agent-browser runbook: approved single-movement G/L classification
 
-This records the successful UI path and the proposed approval safeguards for a future browser-assisted executor. **It is not an implemented execution feature or authorization to book.** The agent must read the installed `agent-browser` skill and use version-matched CLI guidance if needed. Do not replay the captured private website POST, reuse captured security fields or infer a public API contract from it.
+This records the successful manual UI path and the approval safeguards for browser-assisted execution. The opt-in `bank-ui` CLI described below implements the initial expense-only controller; this runbook itself is **not authorization to book**. The observed portal/iframe navigation below is distinct from the controller's direct editor navigation. The latter was verified in the separately approved live cycle recorded below; that is not blanket approval for further financial tests. The agent must read the installed `agent-browser` skill and use version-matched CLI guidance if needed. Do not replay the captured private website POST, reuse captured security fields or infer a public API contract from it.
 
 **Initial scope:** one uniquely selected existing unassigned bank movement, one approved expense/revenue G/L, unchanged amount/currency/date/description/document, and existing blank VAT fields preserved without deduction. Invoice matching, splits, VAT changes, AP/AR reclassification, creating entries, processing journals, automatic allocation rules, deleting/recreating records and correcting journals are outside this first workflow.
 
@@ -319,3 +319,60 @@ This records the successful UI path and the proposed approval safeguards for a f
 At every decision boundary, use one compact scoped snapshot only when structure is unknown, batch known actions, and end with the narrowest useful verification. After a failed verification take one scoped snapshot before changing approach; stop repeated recovery without new evidence. Browser execution does not offer an atomic API compare-and-swap: another user/process can still change records between revalidation and Save. Disclose that residual race and any source coverage gaps rather than promise transactional guarantees.
 
 The observed save preserved existing booking IDs, but that **does not establish the internal mechanism**. Post-save list callbacks included `ApplyAllocationMatchResult=1` and `SCAction=6`; their semantics remain unverified. Internal allocation/command/audit records or server-side operations were not exhaustively snapshotted and cannot be ruled out. This runbook documents a verified UI operation, not proof that direct public booking mutation is the only integration route.
+
+#### Experimental opt-in browser CLI
+
+**This can change financial data.** It is separate from the 34 read-only MCP tools, has no `--yes` flag and must not be self-approved by an agent. A terminal requirement is an interaction safeguard, not cryptographic proof that a human typed the response. The user must explicitly approve the exact preview, log in manually to the intended browser account and must not interact with the browser while the controller runs. Browser account identity is human-confirmed, not inferred from a default assignee or obtained by injecting API credentials.
+
+Initial implemented scope is narrower than the general bank-handling proposals: **one unsplit unassigned outgoing expense**, one verified unblocked expense G/L, default currency/no FX, blank VAT preserved without deduction, no company/dimensions/quantities/references. Incoming/revenue movements, invoice matching, splits, VAT/default changes, new bank entries, correction/deletion/recreation and automatic allocation rules are not supported. Verify the accounting purpose yourself; account metadata and an open period are not tax/accounting approval.
+
+Configure the selected administration's verified unassigned G/L roles with `bank-config` first. Use UUIDs from actual queue/chart results, never names/amounts guessed into identities:
+
+```sh
+exact-mcp bank-ui preview \
+  --control-id <bank-control-line-uuid> \
+  --pending-id <unassigned-counterpart-line-uuid> \
+  --destination-id <verified-expense-gl-uuid> \
+  --expected-expense-amount 11.30 \
+  --currency EUR
+```
+
+The amount above is illustrative: supply the selected positive expense amount, not its negative bank-movement sign. Prefix commands with `nix run . --` if using Nix. Use the same `--data-dir`/`EXACT_MCP_DATA_DIR` and login scope for both commands.
+
+Preview uses GET-only financial reads, checks source identities/balances, current chart/defaults, journal-period restrictions, current API user and related XML MatchSets, then rereads the source. It saves a complete private frozen plan, rather than treating a hash or opaque ID as approval. The returned unpredictable preview ID expires after 30 minutes. Preview never opens a browser or authorizes execution.
+
+From a human interactive terminal:
+
+```sh
+exact-mcp bank-ui execute <preview-id>
+```
+
+The controller revalidates the plan, displays the proposal and requires the user to type `BOOK <preview-id>`. It consumes that approval before opening a new visible browser tab; the user logs in manually and types `READY`. Existing Pi browser isolation is inherited; the controller never supplies a session name or injects OAuth tokens/cookies into the browser. It keeps headed/no-auto-dialog/pin-tab/disabled-idle-shutdown options consistent across commands. Browser restart is allowed only during initial setup, before authentication/form verification; later lifecycle resets abort execution.
+
+The Dutch editor adapter opens the ordinary `/docs/CflEntry.aspx` UI route using the approved bank-control ID/administration. It requires a uniquely identifiable single row, expected hidden identity fields, one visible enabled Opslaan button, exact bank/expense amounts, source description/notes and the approved administration. The user manually logs in and confirms the account with READY; the saved line's Modifier must match the API user afterward. There is no independently verified pre-save browser user UUID. A live probe showed public `/api/v1/current/Me` returns 403 with browser cookies, so the adapter makes **no browser-side API identity request** and never treats a workflow-task default assignee as the authenticated user. Unknown booking-field names also stop the adapter; the disabled VAT-percentage selector is captured and preserved. A changed route/layout/language is a blocker, not a reason for an autonomous alternative workflow.
+
+Only the named G/L textbox is filled. Tab resolves the lookup and a bounded condition wait verifies the destination UUID; no guessed delays or historical snapshot refs are used. Known actions are batched where suitable, while untrusted G/L text is passed as a direct process argument rather than interpolated into a shell. The controller checks source/form/diagnostics again before durably reserving exactly one Opslaan click. Existing or new browser warnings/errors stop the pre-save flow. It never accepts unfamiliar dialogs, replays private POSTs, calls alternate APIs or retries the financial action after a lost response.
+
+After the click, bounded **GET-only** polling/read-back compares the complete native/header/ledger state, checked-period header identities and related matching groups. Only the approved G/L/derived code-name and expected audit changes are allowed; sibling changes, new/deleted records, different actor, changed document/amount/VAT or incomplete evidence mean `uncertain`. If the click acknowledgement is lost but full API/browser checks verify the intended result, it can still report `verified`. An unchanged immediate read after a click is **not** reliable proof of failure: after bounded polling it remains `uncertain`, never permission to Save again. Browser/server evidence is not a database transaction or an exhaustive audit of hidden internal models.
+
+Private records live under `<data-dir>/bank-ui/<preview-id>/`: `plan.json`, consumed `approved.json`, numbered editor/source/form/presave evidence, `save-reserved.json` and `result.json`. A separate cross-process execution lock serializes this data directory's controllers. Files/directories use private Unix permissions and reject symlinks; non-Unix deployments need equivalent ACL protection. Plans contain sensitive financial data and must not be committed/shared raw. No automatic cleanup, rollback, permission changes or retry is performed. After a stop the editor may contain unsaved edits: inspect the recorded outcome and fresh API state before touching Save or preparing another attempt. Concurrent external edits remain a disclosed race.
+
+Validation includes mocked complete source/API/state-machine tests and CLI tests for explicit inputs, no piped confirmation and no automatic-approval flag. An opt-in real-agent-browser smoke test uses only an invented localhost form, verifies the actual selector/lookup/JSON/diagnostics path and one synthetic save request:
+
+```sh
+cargo test --locked --offline real_agent_browser_local_form_smoke -- --ignored --nocapture
+```
+
+It is ignored by normal Cargo/Nix checks so builds do not launch browsers. A separately approved live financial cycle on 2026-11-11 verified the controller for one outgoing expense; see the bounded result below. Synthetic success alone and this single live example do not establish compatibility with every Exact editor configuration. A live test needs its own explicit scope, selected source and human approval. Provider server logs are unavailable; browser diagnostics and API preservation checks are the implemented evidence sources.
+
+#### Separately approved live browser classification cycle
+
+On 2026-11-11 the user explicitly approved temporarily returning the previously classified expense to its verified unassigned G/L, then restoring the original expense G/L through the new controller. The user accepted that audit history/timestamps cannot be undone. Before any financial Save, complete current header/native/ledger, selected-period header and related matching snapshots were saved privately. The setup UI Save changed only the selected G/L and expected audit fields; four native bank rows, eight ledger rows, amounts, blank VAT, existing document link, siblings and two related matching groups were preserved.
+
+Read-only live probes first exposed two adapter issues **before financial execution**: the disabled VAT-percentage selector needed inclusion in the preserved field set, and HTML DOM text normalized source CRLF notes to LF. Only form-to-source text comparison normalizes line endings; final API financial preservation remains exact. Public Me returned 403 with browser cookies, so browser-side API identity requests were removed at the user's direction. The final flow is manual user login/account confirmation, normal UI textbox/Tab/Save actions, and API source/read-back checks; the saved Modifier must match the API actor. Browser idle shutdown was disabled and launch settings kept consistent after an observed session reset. No API credential was injected into the browser or private financial POST replayed.
+
+The real CLI generated an expiring private preview from the temporarily unassigned source. The interactive execution record contains BOOK and READY confirmations, numbered form/source checkpoints, a durable single Save reservation and a **verified** result with unchanged browser diagnostics. The visible confirmation pane disappeared after the process exited successfully; missing terminal UI was not grounds to relaunch or repeat the financial action.
+
+An independent fresh full API capture after execution compared the result against the **original pre-test classified state**, not just the temporary unassigned state. All selected financial fields were restored exactly, including the original expense G/L, amount/currency/VAT/document/date/description/notes/offsets and record identities; all three sibling native bank rows and other ledger postings were completely unchanged. Both related matching groups and selected-period bank-header identity sets were unchanged. Only expected audit metadata differed. No further confirmation or restoration was outstanding. Actual record/administration/account IDs, amounts, approval artifacts and raw source/browser evidence remain private outside the repository.
+
+This validates the normal UI expense-classification path and independent restoration checks for the scoped example. It is not a payment execution test, proof of bank settlement, universal UI/API compatibility or evidence that no internal command/audit records were created. Additional live writes still require their own explicit proposal/approval.

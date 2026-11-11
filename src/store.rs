@@ -317,7 +317,7 @@ impl Store {
     }
 }
 
-fn check_private(path: &Path) -> Result<()> {
+pub(crate) fn check_private(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_symlink() {
         bail!(

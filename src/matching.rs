@@ -132,7 +132,7 @@ struct XmlSets {
     sets: Vec<XmlSet>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct XmlSet {
     #[serde(rename = "GLAccount")]
@@ -143,21 +143,21 @@ struct XmlSet {
     lines: XmlLines,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct XmlCode {
     #[serde(rename = "@code")]
     code: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct XmlLines {
     #[serde(rename = "MatchLine", default)]
     lines: Vec<XmlLine>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct XmlLine {
     #[serde(rename = "@finyear")]
@@ -567,3 +567,59 @@ pub(crate) async fn get_matches(
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) async fn bank_entry_groups(
+    client: &ExactClient,
+    division: u32,
+    year: i32,
+    period: i32,
+    journal: &str,
+    entry: i64,
+) -> Result<Vec<serde_json::Value>> {
+    let mut groups = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut total = 0usize;
+    let mut size = None;
+    for _ in 0..EXPORT_PAGES {
+        let bytes = client
+            .get_match_sets_page(division, cursor.as_deref(), PAGE_BYTES)
+            .await?;
+        total = total
+            .checked_add(bytes.len())
+            .context("Matching size overflow")?;
+        ensure!(total <= EXPORT_BYTES, "Matching export size limit reached");
+        let export = parse_export(&bytes)?;
+        let Some(topic) = export.topics.topic else {
+            groups.sort_by_cached_key(ToString::to_string);
+            return Ok(groups);
+        };
+        ensure!(
+            size.is_none_or(|n| n == topic.page_size),
+            "Matching page size changed"
+        );
+        size = Some(topic.page_size);
+        if let Some(previous) = &cursor {
+            ensure!(
+                topic.count == 0
+                    || topic.cursor[2..].to_ascii_uppercase() > previous[2..].to_ascii_uppercase(),
+                "Matching cursor did not advance"
+            );
+        }
+        for set in export.sets.sets {
+            if set.lines.lines.iter().any(|line| {
+                line.year == year
+                    && line.period == period
+                    && line.journal.trim() == journal.trim()
+                    && line.entry == entry
+            }) {
+                groups.push(serde_json::to_value(set)?);
+            }
+        }
+        if topic.count < topic.page_size {
+            groups.sort_by_cached_key(ToString::to_string);
+            return Ok(groups);
+        }
+        cursor = Some(topic.cursor);
+    }
+    bail!("Matching export page limit reached")
+}

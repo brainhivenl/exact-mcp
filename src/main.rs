@@ -65,6 +65,25 @@ enum Command {
         #[command(subcommand)]
         command: BankConfigCommand,
     },
+    #[command(
+        about = "Preview or explicitly approve a browser-assisted existing bank expense classification. Not exposed through MCP."
+    )]
+    BankUi {
+        #[command(subcommand)]
+        command: BankUiCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BankUiCommand {
+    #[command(
+        about = "Read source data and save a private, expiring preview. No browser or financial write."
+    )]
+    Preview(bank::ui::Selection),
+    #[command(
+        about = "Require interactive human approval, use the visible Exact UI once, then verify through GET-only APIs."
+    )]
+    Execute { preview_id: String },
 }
 
 #[derive(Subcommand)]
@@ -157,6 +176,12 @@ async fn run(cli: Cli) -> Result<()> {
         #[cfg(unix)]
         Command::Pi { args } => launch_pi(args).await?,
         Command::Serve => mcp::serve(directory).await?,
+        Command::BankUi { command } => match command {
+            BankUiCommand::Preview(args) => bank::ui::prepare(directory, args).await?,
+            BankUiCommand::Execute { preview_id } => {
+                bank::ui::execute(directory, preview_id).await?
+            }
+        },
         Command::Auth {
             command:
                 AuthCommand::Login {

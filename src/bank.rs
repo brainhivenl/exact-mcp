@@ -12,6 +12,8 @@ use crate::financial::{ExactDate, Money, deserialize_report_id};
 use crate::invoice;
 use crate::store::{Administration, BankConfiguration};
 
+pub(crate) mod ui;
+
 mod xml_preview;
 pub(crate) use xml_preview::preview;
 pub use xml_preview::{BankXmlPreview, PreviewBankGlXml};

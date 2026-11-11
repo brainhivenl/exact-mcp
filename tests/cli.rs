@@ -721,3 +721,71 @@ fn bank_config_set_rejects_invalid_input_without_network_or_overwriting_configur
         assert_eq!(std::fs::read(&configuration_path).unwrap(), before);
     }
 }
+
+#[test]
+fn bank_ui_help_is_local_and_execution_rejects_piped_confirmation() {
+    let root = TempDir::new().unwrap();
+    let directory = root.path().join("data");
+    for args in [
+        vec!["bank-ui", "--help"],
+        vec!["bank-ui", "preview", "--help"],
+        vec!["bank-ui", "execute", "--help"],
+    ] {
+        let result = run(&directory, &args);
+        assert!(result.status.success());
+        assert!(!directory.exists());
+    }
+    let result = run(
+        &directory,
+        &["bank-ui", "execute", "00000000000000000000000000000001"],
+    );
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("human interactive terminal")
+    );
+    assert!(!directory.exists());
+    let result = run(
+        &directory,
+        &[
+            "bank-ui",
+            "execute",
+            "00000000000000000000000000000001",
+            "--yes",
+        ],
+    );
+    assert!(!result.status.success());
+    assert!(!directory.exists());
+}
+
+#[test]
+fn bank_ui_preview_requires_explicit_ids_amount_currency_and_login() {
+    let root = TempDir::new().unwrap();
+    let directory = root.path().join("data");
+    let result = run(&directory, &["bank-ui", "preview"]);
+    assert!(!result.status.success());
+    assert!(!directory.exists());
+    let args = [
+        "bank-ui",
+        "preview",
+        "--control-id",
+        "00000000-0000-0000-0000-000000000101",
+        "--pending-id",
+        "00000000-0000-0000-0000-000000000201",
+        "--destination-id",
+        "00000000-0000-0000-0000-000000000200",
+        "--expected-expense-amount",
+        "11.30",
+        "--currency",
+        "EUR",
+    ];
+    let result = run(&directory, &args);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("auth login")
+    );
+    assert!(!directory.join("bank-ui").exists());
+}
