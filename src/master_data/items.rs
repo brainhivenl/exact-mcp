@@ -9,15 +9,15 @@ const ITEM_INTERPRETATION: &str = "Current item/article (artikel) master data. S
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
 pub struct Item {
-    start_date: Option<ExactDate>,
-    end_date: Option<ExactDate>,
+    pub(crate) start_date: Option<ExactDate>,
+    pub(crate) end_date: Option<ExactDate>,
     is_purchase_item: Option<bool>,
-    is_sales_item: Option<bool>,
+    pub(crate) is_sales_item: Option<bool>,
     is_stock_item: Option<bool>,
-    is_fraction_allowed_item: Option<bool>,
+    pub(crate) is_fraction_allowed_item: Option<bool>,
     is_taxable_item: Option<u8>,
     #[serde(rename(deserialize = "Unit"))]
-    unit_code: Option<String>,
+    pub(crate) unit_code: Option<String>,
     unit_description: Option<String>,
     unit_type: Option<String>,
     #[serde(rename(deserialize = "SalesVatCode"))]
@@ -152,7 +152,7 @@ fn item_uuid(value: &str) -> Result<Uuid> {
     Ok(id)
 }
 
-async fn load_item(
+pub(crate) async fn load_item(
     client: &ExactClient,
     administration: &Administration,
     id: Uuid,

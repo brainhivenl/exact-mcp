@@ -1,6 +1,6 @@
 # exact-mcp
 
-**Ask your AI assistant about your Exact Online bookkeeping, with explicit approval for bank-expense classification.**
+**Investigate Exact Online bookkeeping, create and edit sales drafts, and approve bank-expense classification through your AI assistant.**
 
 exact-mcp is a local [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for Exact Online. It connects your assistant to one explicitly selected administration so you can investigate invoices, outstanding balances, bank postings and ledger activity using current accounting data.
 
@@ -9,6 +9,7 @@ exact-mcp is a local [Model Context Protocol (MCP)](https://modelcontextprotocol
 | Workflow | Example question |
 | --- | --- |
 | Outstanding balances and aging | “What do we owe suppliers, and what is more than 90 days overdue?” |
+| Sales drafts | “Find this client and service article, create a draft invoice, then adjust its description or line price.” |
 | Invoice investigation | “Find this supplier invoice, show its accounting lines and download the existing PDF.” |
 | Recorded matching | “What allocations are recorded against this invoice, and which cashflow postings are linked?” |
 | Bank transactions needing attention | “Show the reconstructed bank queue, its booking lines and any unresolved links.” |
@@ -18,11 +19,11 @@ exact-mcp is a local [Model Context Protocol (MCP)](https://modelcontextprotocol
 
 See [booking preparation and bank-handling workflows](docs/booking.md) for proposal scope, safeguards and validation details.
 
-You can also inspect unprocessed commercial sales invoices and look up items, units and supplier-item context where your Exact subscription supports them. Purchase preflight and duplicate evidence support human review; neither authorizes booking. The browser expense workflow requires its own exact preview and explicit user confirmation.
+You can also create/edit normal open sales drafts and look up clients, articles, units and supplier-item context where your Exact subscription supports them. Draft writes run on request, with optional `dry_run` previews; they never process or send invoices. See [the sales-draft workflow](docs/usage.md#sales-draft-creation-and-editing). Purchase preflight and duplicate evidence support human review; neither authorizes booking. The browser expense workflow requires its own exact preview and explicit user confirmation.
 
 ## Boundaries that matter
 
-- **Narrow, explicitly approved bank handling:** financial queries remain read-only. A separate experimental browser workflow can classify one existing unassigned outgoing expense, preserving the amount, VAT, document and other lines. No general invoice creation/editing/sending, matching or payment execution is exposed. PDF downloads create private local files only.
+- **Scoped financial writes:** sales tools create normal editable drafts or edit selected header fields/one existing line. They do not finalize, print, send, delete invoices, match or pay. An independent, explicitly approved experimental browser workflow can classify one existing unassigned outgoing expense. Financial query/proposal tools remain read-only; PDF downloads create private local files only.
 - **Accounting evidence is not bank settlement:** matching shows recorded allocations, not an immutable matching history or proof that money cleared. The bank queue is an API reconstruction, not Exact’s authoritative UI completion state.
 - **Missing links are not duplicate clearance:** purchase-document discovery is not a complete inbox or proof that a document is unbooked.
 - **Amounts need context:** original invoice amounts differ from open balances. Signs and currencies are preserved; currencies are not converted or combined. Ledger reports show period movement, not opening/closing balances. Reads are current, not frozen snapshots.

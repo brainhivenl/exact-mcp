@@ -32,7 +32,7 @@ pub struct BookingAccount {
     pub(crate) is_blocked: Option<bool>,
     pub(crate) is_supplier: Option<bool>,
     #[serde(rename(deserialize = "IsSales"))]
-    sales_allowed: Option<bool>,
+    pub(crate) sales_allowed: Option<bool>,
     #[serde(rename(deserialize = "Status"))]
     customer_status: Option<String>,
     country: Option<String>,

@@ -11,20 +11,20 @@ use super::*;
 use crate::financial::Backend;
 use crate::store::{Session, Store, Tokens};
 
-const ACCOUNT: &str = "11111111-1111-1111-1111-111111111111";
+pub(super) const ACCOUNT: &str = "11111111-1111-1111-1111-111111111111";
 const ORDERED_BY: &str = "22222222-2222-2222-2222-222222222222";
-const INVOICE: &str = "33333333-3333-3333-3333-333333333333";
+pub(super) const INVOICE: &str = "33333333-3333-3333-3333-333333333333";
 const OTHER_INVOICE: &str = "44444444-4444-4444-4444-444444444444";
-const LINE: &str = "55555555-5555-5555-5555-555555555555";
+pub(super) const LINE: &str = "55555555-5555-5555-5555-555555555555";
 const OTHER_LINE: &str = "66666666-6666-6666-6666-666666666666";
 
-struct Response {
-    status: u16,
-    body: Value,
+pub(super) struct Response {
+    pub(super) status: u16,
+    pub(super) body: Value,
 }
 
 impl Response {
-    fn rows(rows: Vec<Value>) -> Self {
+    pub(super) fn rows(rows: Vec<Value>) -> Self {
         Self {
             status: 200,
             body: json!({"d": rows}),
@@ -46,14 +46,14 @@ impl Response {
     }
 }
 
-struct Server {
+pub(super) struct Server {
     base: String,
-    requests: Arc<Mutex<Vec<String>>>,
+    pub(super) requests: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
 }
 
 impl Server {
-    async fn new(responses: Vec<Response>) -> Self {
+    pub(super) async fn new(responses: Vec<Response>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -70,8 +70,19 @@ impl Server {
                         break;
                     }
                     bytes.extend_from_slice(&buffer[..count]);
-                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
                     }
                 }
                 recorded
@@ -79,6 +90,9 @@ impl Server {
                     .unwrap()
                     .push(String::from_utf8(bytes).unwrap());
                 let response = responses.pop_front().unwrap_or_else(Response::denied);
+                if response.status == 0 {
+                    continue;
+                }
                 let body = response.body.to_string();
                 let reply = format!(
                     "HTTP/1.1 {} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -116,7 +130,7 @@ impl Drop for Server {
     }
 }
 
-async fn backend(server: &Server) -> (TempDir, Backend) {
+pub(super) async fn backend(server: &Server) -> (TempDir, Backend) {
     let directory = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     {

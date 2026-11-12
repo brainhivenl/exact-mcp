@@ -17,6 +17,7 @@ use crate::store::Administration;
 pub struct Backend {
     client: ExactClient,
     administration: Administration,
+    draft_writes: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default, Deserialize, Serialize, JsonSchema)]
@@ -366,6 +367,7 @@ impl Backend {
         Ok(Self {
             client,
             administration,
+            draft_writes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -400,6 +402,30 @@ impl Backend {
         args: crate::pdf::DownloadInvoicePdf,
     ) -> Result<crate::pdf::DownloadedInvoicePdf> {
         crate::pdf::download_pdf(&self.client, &self.administration, args).await
+    }
+
+    pub async fn create_draft_invoice(
+        &self,
+        args: crate::draft::write::CreateDraftInvoice,
+    ) -> Result<serde_json::Value> {
+        let _guard = self.draft_writes.lock().await;
+        crate::draft::write::create(&self.client, &self.administration, args).await
+    }
+
+    pub async fn update_draft_invoice(
+        &self,
+        args: crate::draft::write::UpdateDraftInvoice,
+    ) -> Result<serde_json::Value> {
+        let _guard = self.draft_writes.lock().await;
+        crate::draft::write::update(&self.client, &self.administration, args).await
+    }
+
+    pub async fn update_draft_invoice_line(
+        &self,
+        args: crate::draft::write::UpdateDraftInvoiceLine,
+    ) -> Result<serde_json::Value> {
+        let _guard = self.draft_writes.lock().await;
+        crate::draft::write::update_line(&self.client, &self.administration, args).await
     }
 
     pub async fn search_draft_invoices(

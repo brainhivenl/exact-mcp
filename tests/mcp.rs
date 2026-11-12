@@ -200,7 +200,7 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
     assert!(info["result"]["capabilities"]["tools"].is_object());
     let discovery = process.request(2, "tools/list", json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 36);
+    assert_eq!(tools.len(), 39);
     for tool in tools {
         assert_eq!(
             tool["annotations"]["readOnlyHint"],
@@ -208,15 +208,28 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
                 && tool["name"] != "download_purchase_document_pdf"
                 && tool["name"] != "preview_bank_ui_classification"
                 && tool["name"] != "execute_bank_ui_classification"
+                && tool["name"] != "create_draft_invoice"
+                && tool["name"] != "update_draft_invoice"
+                && tool["name"] != "update_draft_invoice_line"
         );
         assert_eq!(
             tool["annotations"]["destructiveHint"],
-            tool["name"] == "execute_bank_ui_classification"
+            matches!(
+                tool["name"].as_str(),
+                Some(
+                    "execute_bank_ui_classification"
+                        | "update_draft_invoice"
+                        | "update_draft_invoice_line"
+                )
+            )
         );
         if tool["name"] == "download_invoice_pdf"
             || tool["name"] == "download_purchase_document_pdf"
             || tool["name"] == "preview_bank_ui_classification"
             || tool["name"] == "execute_bank_ui_classification"
+            || tool["name"] == "create_draft_invoice"
+            || tool["name"] == "update_draft_invoice"
+            || tool["name"] == "update_draft_invoice_line"
         {
             assert_eq!(tool["annotations"]["idempotentHint"], false);
         }
@@ -224,6 +237,9 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             tool["name"].as_str(),
             Some(
                 "search_accounts"
+                    | "create_draft_invoice"
+                    | "update_draft_invoice"
+                    | "update_draft_invoice_line"
                     | "preview_bank_ui_classification"
                     | "execute_bank_ui_classification"
                     | "preview_bank_gl_xml"
@@ -281,6 +297,43 @@ fn stdio_handshake_discovery_and_financial_queries_are_read_only() {
             !schema["required"]
                 .as_array()
                 .is_some_and(|required| required.contains(&json!("query")))
+        );
+    }
+    for name in [
+        "create_draft_invoice",
+        "update_draft_invoice",
+        "update_draft_invoice_line",
+    ] {
+        let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["dry_run"]["default"], false);
+        for forbidden in ["status", "process", "send", "approval_token"] {
+            assert!(schema["properties"].get(forbidden).is_none());
+        }
+    }
+    let creation = &tools
+        .iter()
+        .find(|tool| tool["name"] == "create_draft_invoice")
+        .unwrap()["inputSchema"];
+    assert!(
+        creation["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("request_id"))
+    );
+    for field in ["quantity", "unit_price"] {
+        assert_eq!(
+            creation["$defs"]["SalesLine"]["properties"][field]["type"],
+            "string"
+        );
+    }
+    for name in ["update_draft_invoice", "update_draft_invoice_line"] {
+        let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("expected_modified"))
         );
     }
     let xml_schema = &tools
@@ -2355,4 +2408,128 @@ fn stdio_xml_bank_preview_returns_a_blocked_specimen_and_exposes_no_upload_actio
     api.join().unwrap();
     process.shutdown();
     assert!(!directory.join("downloads").exists());
+}
+
+#[test]
+fn stdio_sales_draft_creation_and_header_edit_write_without_an_approval_ceremony() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let invoice = "22222222-2222-2222-2222-222222222222";
+    let item = "33333333-3333-3333-3333-333333333333";
+    let gl = "44444444-4444-4444-4444-444444444444";
+    let line_id = "55555555-5555-5555-5555-555555555555";
+    let modified = "/Date(1760000000123)/";
+    let api = thread::spawn(move || {
+        let account =
+            json!({"ID":ACCOUNT_ID,"Division":42,"Code":"1001","Blocked":false,"IsSales":true});
+        let header = json!({"InvoiceID":invoice,"Division":42,"InvoiceTo":ACCOUNT_ID,"OrderedBy":ACCOUNT_ID,
+            "Journal":"70","Status":20,"Type":8020,"Currency":"EUR","InvoiceDate":"2025-01-01",
+            "Modified":modified,"AmountFC":121,"AmountFCExclVat":100,"VATAmountFC":21});
+        let line = json!({"ID":line_id,"InvoiceID":invoice,"Division":42,"LineNumber":1,"Item":item,
+            "GLAccount":gl,"Description":"Custom services","Quantity":1,"UnitCode":"hour","UnitPrice":100,"Discount":0,"VATCode":"1"});
+        let sources = vec![
+            ("GET", "/salesinvoice/SalesInvoices?", json!([])),
+            ("GET", "/crm/Accounts?", json!([account.clone()])),
+            (
+                "GET",
+                "/financial/Journals?",
+                json!([{"ID":"66666666-6666-6666-6666-666666666666","Division":42,"Code":"70","Type":20,"IsBlocked":false,"Currency":"EUR"}]),
+            ),
+            (
+                "GET",
+                "/vat/VATCodes?",
+                json!([{"ID":"77777777-7777-7777-7777-777777777777","Division":42,"Code":"1","Type":"E","IsBlocked":false,"VATTransactionType":"S"}]),
+            ),
+            ("GET", "/vat/VatPercentages?", json!([])),
+            (
+                "GET",
+                "/financial/GLAccounts?",
+                json!([{"ID":gl,"Division":42,"Code":"8000","Type":110,"IsBlocked":false,"UseCostcenter":0,"UseCostunit":0}]),
+            ),
+            (
+                "GET",
+                "/logistics/Items?",
+                json!([{"ID":item,"Division":42,"Code":"SERVICE","IsSalesItem":true,"Unit":"hour"}]),
+            ),
+        ];
+        let details = |h: Value| {
+            vec![
+                ("GET", "/crm/Accounts?", json!([account.clone()])),
+                ("GET", "/salesinvoice/SalesInvoices?", json!([h])),
+                (
+                    "GET",
+                    "/system/Divisions?",
+                    json!([{"Code":42,"Currency":"EUR"}]),
+                ),
+                (
+                    "GET",
+                    "/salesinvoice/SalesInvoiceLines?",
+                    json!([line.clone()]),
+                ),
+            ]
+        };
+        let mut replies = sources.clone();
+        replies.extend(sources);
+        replies.push(("POST", "/salesinvoice/SalesInvoices ", json!({})));
+        replies.extend(details(header.clone()));
+        replies.extend(details(header.clone()));
+        replies.push(("GET", "/crm/Accounts?", json!([account.clone()])));
+        replies.extend(details(header.clone()));
+        replies.push(("PUT", "/salesinvoice/SalesInvoices(guid'", json!({})));
+        let mut after = header;
+        after["Description"] = json!("Updated through MCP");
+        after["Modified"] = json!("/Date(1760000000456)/");
+        replies.extend(details(after));
+        for (method, path, rows) in replies {
+            let (mut stream, target) = accept_request(&listener);
+            assert!(
+                target.starts_with(&format!("{method} /api/v1/42/")),
+                "{target}"
+            );
+            assert!(target.contains(path), "{target}");
+            send_response(&mut stream, json!({"d":rows}));
+        }
+    });
+    let (_root, directory, _) = fixture_session(&base);
+    let mut process = McpProcess::start(&directory);
+    process.initialize();
+    let mut args = json!({"request_id":invoice,"account_id":ACCOUNT_ID,"ordered_by_id":ACCOUNT_ID,
+        "journal_code":"70","currency":"EUR","invoice_date":"2025-01-01","dry_run":true,
+        "lines":[{"item_id":item,"gl_account_id":gl,"description":"Custom services","quantity":"1","unit_code":"hour","unit_price":"100.00","vat_code":"1"}]});
+    let preview = process.request(
+        2,
+        "tools/call",
+        json!({"name":"create_draft_invoice","arguments":args}),
+    );
+    assert_eq!(
+        preview["result"]["structuredContent"]["status"], "preview",
+        "{preview}"
+    );
+    args["dry_run"] = json!(false);
+    let created = process.request(
+        3,
+        "tools/call",
+        json!({"name":"create_draft_invoice","arguments":args}),
+    );
+    assert_eq!(
+        created["result"]["structuredContent"]["status"], "created",
+        "{created}"
+    );
+    let result = &created["result"]["structuredContent"];
+    assert_eq!(result["verified"], true);
+    assert_eq!(
+        result["details"]["invoice"]["amount_transaction_currency"],
+        "121"
+    );
+    assert_eq!(result["details"]["invoice"]["modified"], modified);
+    let edited = process.request(4,"tools/call",json!({"name":"update_draft_invoice","arguments":{
+        "account_id":ACCOUNT_ID,"invoice_id":invoice,"expected_modified":modified,"description":"Updated through MCP"}}));
+    assert_eq!(
+        edited["result"]["structuredContent"]["status"], "updated",
+        "{edited}"
+    );
+    assert!(!edited.to_string().contains("fixture-access-token"));
+    api.join().unwrap();
+    process.shutdown();
 }

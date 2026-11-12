@@ -1,6 +1,6 @@
 # Booking preparation and approved bank handling
 
-Run commands from the repository root. See [the overview](../README.md) and [setup and operational notes](usage.md). Historical investigations below describe the capabilities and approval limits at the time; the conversational browser executor is the current narrow financial-write exception.
+Run commands from the repository root. See [the overview](../README.md) and [setup and operational notes](usage.md). Historical investigations below describe the capabilities and approval limits at the time; the conversational browser executor is the narrow bank-write exception. [Sales-draft creation and editing](usage.md#sales-draft-creation-and-editing) is a separate API workflow.
 
 ### Read-only purchase duplicate assessment
 

@@ -378,6 +378,48 @@ impl ExactClient {
         store.save_invoice_pdf(division, attachment_id, bytes).await
     }
 
+    pub(crate) async fn write_sales_invoice(
+        &self,
+        division: u32,
+        line: bool,
+        id: Option<uuid::Uuid>,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        ensure!(
+            self.pinned_administration == Some(division),
+            "Invoice administration must match the selected administration"
+        );
+        ensure!(!self.refreshes.is_closed(), "Exact client is shutting down");
+        let resource = if line {
+            "SalesInvoiceLines"
+        } else {
+            "SalesInvoices"
+        };
+        let suffix = id.map(|id| format!("(guid'{id}')")).unwrap_or_default();
+        let url = self.base_url.join(&format!(
+            "/api/v1/{division}/salesinvoice/{resource}{suffix}"
+        ))?;
+        let token = self.access_token().await?;
+        self.session().await?;
+        let method = if id.is_some() {
+            reqwest::Method::PUT
+        } else {
+            reqwest::Method::POST
+        };
+        let response = self.http.request(method, url)
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(payload)
+            .send().await
+            .map_err(|_| anyhow::anyhow!("Invoice write outcome unknown; inspect the invoice UUID before any further write. No automatic retry"))?;
+        ensure!(
+            matches!(response.status().as_u16(), 200 | 201 | 204),
+            "Invoice write returned HTTP {}; inspect the invoice UUID before any further write. No automatic retry",
+            response.status()
+        );
+        Ok(())
+    }
+
     pub async fn get_collection<T: DeserializeOwned>(&self, url: Url) -> Result<Vec<T>> {
         self.read_collection(url, 0, None).await
     }
